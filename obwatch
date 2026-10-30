@@ -1,0 +1,826 @@
+#!/usr/bin/env python3
+"""obwatch - watch one OpenBot agent: its reasoning, its commands, and the live
+output of everything it runs (foreground commands, background jobs, and
+detached processes such as servers writing to log files).
+
+  obwatch                 pick an agent from a list
+  obwatch coder           open the agent whose name contains "coder"
+  obwatch coder -f FILE   also pin FILE as a tab
+  obwatch coder --plain   no TUI, just stream the activity feed
+
+Keys:  Tab/Shift-Tab or <-/->/1-9 switch tabs   Up/Down/PgUp/PgDn/g scroll
+       G or End follow   e expand outputs   x / X close tab / all finished tabs
+       a agent list      q quit
+"""
+__version__ = "0.1.0"
+
+import argparse, collections, curses, datetime as dt, glob, json, locale, os, re, sqlite3, sys, tempfile, time
+
+HOME = os.path.expanduser("~")
+PROJECTS = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude"), "projects")
+DB = os.path.join(HOME, ".config/OpenBot/openbot.db")
+SHELLS = {"sh", "bash", "zsh", "dash", "nohup", "setsid", "timeout", "env", "stdbuf", "nice", "sudo", "xargs", "time"}
+UTILS = {"sleep", "cat", "tail", "head", "grep", "sed", "awk", "tee", "wc", "sort", "uniq", "cut", "tr", "echo", "printf", "date", "ls", "find", "xargs", "pgrep", "ps"}
+SUBCMD = {"docker", "cargo", "npm", "pnpm", "yarn", "git", "go", "make", "python", "python3", "node", "uv", "pip", "npx", "kubectl"}
+CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")   # control bytes (NULs from truncated logs, binary output)
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[()][A-Z0-9]")
+LOGLIKE = re.compile(r"\.(log|out|output|txt)$")
+TASK_ID = re.compile(r"(?:with ID: |\(task )([a-z0-9]{6,})")
+TICKS = os.sysconf("SC_CLK_TCK")
+KEEP_DONE = 15 * 60      # finished tabs stay this long
+KEEP_GONE = 10           # ...unless their file was deleted (finished foreground commands)
+MAX_DONE = 12            # at most this many finished tabs; oldest are dropped first
+
+
+def boot_time():
+    for line in open("/proc/stat"):
+        if line.startswith("btime"):
+            return int(line.split()[1])
+    return 0
+
+
+BOOT = boot_time()
+
+
+def ago(sec):
+    sec = int(max(sec, 0))
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m"
+    if sec < 86400:
+        return f"{sec // 3600}h{sec % 3600 // 60:02d}m"
+    return f"{sec // 86400}d"
+
+
+# ---------------------------------------------------------------- agents
+
+class Agent:
+    def __init__(self, aid, d):
+        self.id, self.name = aid, d.get("name") or aid
+        self.title = d.get("title") or ""
+        self.provider = d.get("provider") or "?"
+        ws = d.get("workspacePath") or os.path.join(HOME, "OpenBot/Agents", aid)
+        self.projdir = os.path.join(PROJECTS, re.sub(r"[^A-Za-z0-9]", "-", ws))
+
+    def sessions(self):
+        return {os.path.basename(p)[:-6] for p in glob.glob(os.path.join(self.projdir, "*.jsonl"))}
+
+    def last_write(self):
+        ts = [os.path.getmtime(p) for p in glob.glob(os.path.join(self.projdir, "**/*.jsonl"), recursive=True)]
+        return max(ts, default=0)
+
+
+def load_agents():
+    try:
+        db = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=2)
+        rows = db.execute("select agent_id, agent_json from projection_agents order by sort_order").fetchall()
+        db.close()
+    except Exception:
+        rows = []
+    agents = [Agent(aid, json.loads(j)) for aid, j in rows]
+    known = {a.projdir for a in agents}
+    for d in glob.glob(os.path.join(PROJECTS, "*")):   # transcripts without an OpenBot agent
+        if d not in known and glob.glob(os.path.join(d, "*.jsonl")):
+            a = Agent(os.path.basename(d), {"name": os.path.basename(d)[-28:], "provider": "claude"})
+            a.projdir = d
+            agents.append(a)
+    return agents
+
+
+# ---------------------------------------------------------------- processes
+
+def scan_procs():
+    procs, uid = {}, os.getuid()
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            if os.stat(f"/proc/{d}").st_uid != uid:
+                continue
+            st = open(f"/proc/{d}/stat", "rb").read().decode("utf-8", "replace")
+            f = st[st.rindex(")") + 2:].split()
+            cmd = [c.decode("utf-8", "replace") for c in open(f"/proc/{d}/cmdline", "rb").read().split(b"\0") if c]
+            env = open(f"/proc/{d}/environ", "rb").read()
+        except (OSError, ValueError):
+            continue
+        if not cmd:
+            continue
+        m = re.search(rb"(?:^|\0)CLAUDE_CODE_SESSION_ID=([^\0]+)", env)
+        procs[int(d)] = dict(pid=int(d), ppid=int(f[1]), cmd=cmd, start=BOOT + int(f[19]) / TICKS,
+                             sid=m.group(1).decode() if m else None)
+    return procs
+
+
+def base(p):
+    return os.path.basename(p["cmd"][0])
+
+
+def is_claude(p):
+    return base(p) == "claude"
+
+
+def is_shell(p):
+    return base(p) in SHELLS
+
+
+def agent_procs(procs, sessions):
+    """Processes started by the agent's commands (incl. detached ones), minus MCP servers."""
+    keep = []
+    for p in procs.values():
+        if p["sid"] not in sessions or is_claude(p):
+            continue
+        q, ok = p, True
+        while True:
+            par = procs.get(q["ppid"])
+            if par is None:
+                break
+            if is_claude(par):
+                ok = is_shell(q)   # Bash tool runs a shell; other direct children are MCP servers
+                break
+            q = par
+        if ok:
+            keep.append(p)
+    return keep
+
+
+def out_files(pid):
+    res = set()
+    try:
+        fds = os.listdir(f"/proc/{pid}/fd")
+    except OSError:
+        return res
+    for fd in fds:
+        try:
+            t = os.readlink(f"/proc/{pid}/fd/{fd}")
+        except OSError:
+            continue
+        if not t.startswith("/") or t.startswith(("/dev/", "/proc/", "/sys/")) or t.endswith(" (deleted)"):
+            continue
+        if fd in ("1", "2"):
+            res.add(t)
+        elif LOGLIKE.search(t):
+            try:
+                flags = int(open(f"/proc/{pid}/fdinfo/{fd}").read().split("flags:")[1].split()[0], 8)
+                if flags & 3:
+                    res.add(t)
+            except (OSError, IndexError, ValueError):
+                pass
+    return {t for t in res if os.path.isfile(t)}
+
+
+def proc_label(ps):
+    for p in sorted(ps, key=lambda p: p["start"]):
+        if is_shell(p) or base(p) in UTILS:
+            continue
+        b = base(p)
+        args = [a for a in p["cmd"][1:] if not a.startswith("-")]
+        if b in SUBCMD and args:
+            b += " " + os.path.basename(args[0])
+        return b
+    return None
+
+
+def agent_jobs(procs, sessions):
+    by_file = collections.defaultdict(list)
+    for p in agent_procs(procs, sessions):
+        for f in out_files(p["pid"]):
+            by_file[f].append(p)
+    return by_file
+
+
+# ---------------------------------------------------------------- activity feed
+
+class Feed:
+    def __init__(self, agent):
+        self.agent = agent
+        self.pos, self.part = {}, {}
+        self.events = collections.deque(maxlen=4000)
+        self.total = 0
+        self.tools, self.task_desc, self.pending = {}, {}, collections.OrderedDict()
+        self.primed = False
+
+    def poll(self):
+        files = glob.glob(os.path.join(self.agent.projdir, "**/*.jsonl"), recursive=True)
+        cutoff = time.time() - 48 * 3600
+        for p in sorted(files, key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0):
+            try:
+                size, mtime = os.path.getsize(p), os.path.getmtime(p)
+            except OSError:
+                continue
+            if p not in self.pos:
+                self.pos[p] = 0 if (not self.primed and mtime >= cutoff) or self.primed else size
+            if size < self.pos[p]:
+                self.pos[p] = 0
+            if size == self.pos[p]:
+                continue
+            with open(p, "rb") as f:
+                f.seek(self.pos[p])
+                data = f.read(16 << 20)
+            self.pos[p] += len(data)
+            lines = (self.part.pop(p, b"") + data).split(b"\n")
+            if lines[-1]:
+                self.part[p] = lines[-1]
+            for line in lines[:-1]:
+                try:
+                    self.add(json.loads(line))
+                except (ValueError, AttributeError):
+                    pass
+        self.primed = True
+
+    def ev(self, ts, kind, text, **kw):
+        self.events.append(dict(ts=ts, kind=kind, text=text, **kw))
+        self.total += 1
+
+    def add(self, rec):
+        t = rec.get("type")
+        if t not in ("user", "assistant"):
+            return
+        ts, epoch = "", time.time()
+        try:
+            u = dt.datetime.fromisoformat(rec["timestamp"].replace("Z", "+00:00")).astimezone()
+            ts, epoch = u.strftime("%H:%M:%S"), u.timestamp()
+        except (KeyError, ValueError):
+            pass
+        side = bool(rec.get("isSidechain"))
+        content = (rec.get("message") or {}).get("content")
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        for b in content or []:
+            bt = b.get("type")
+            if t == "user" and bt == "text":
+                if not rec.get("isMeta"):
+                    self.ev(ts, "msg", b.get("text", ""), side=side)
+            elif bt == "text":
+                if b.get("text", "").strip():
+                    self.ev(ts, "say", b["text"].strip(), side=side)
+            elif bt in ("thinking", "redacted_thinking"):
+                self.ev(ts, "think", (b.get("thinking") or "").strip(), side=side)
+            elif bt == "tool_use":
+                name, inp = b.get("name", "?"), b.get("input") or {}
+                self.tools[b.get("id")] = (name, inp)
+                if name == "Bash":
+                    self.ev(ts, "cmd", inp.get("command", ""), desc=inp.get("description", ""),
+                            bg=bool(inp.get("run_in_background")), side=side)
+                    label = inp.get("description") or inp.get("command", "")[:60]
+                else:
+                    self.ev(ts, "tool", tool_detail(name, inp), name=name.split("__")[-1], side=side)
+                    label = name.split("__")[-1]
+                self.pending[b.get("id")] = (epoch, label, name)
+            elif bt == "tool_result":
+                tid = b.get("tool_use_id")
+                self.pending.pop(tid, None)
+                name, inp = self.tools.get(tid, ("?", {}))
+                c = b.get("content")
+                if isinstance(c, list):
+                    c = "\n".join(x.get("text", f"[{x.get('type')}]") for x in c)
+                c = (c or "").strip()
+                m = TASK_ID.search(c[:300])
+                if m:
+                    self.task_desc[m.group(1)] = inp.get("description") or name
+                self.ev(ts, "err" if b.get("is_error") else "out", c or "(no output)", name=name, side=side)
+
+    def running(self):
+        now = time.time()
+        return [v for v in self.pending.values() if now - v[0] < 11 * 60]
+
+    def rows(self, expand):
+        """-> list of (ts, tag, style, text)"""
+        out = []
+        for e in self.events:
+            k, ts, pre = e["kind"], e["ts"], "↳" if e.get("side") else ""
+            if k == "msg":
+                out.append((ts, pre + "IN", "msg", e["text"] if expand else clip(e["text"], 6)))
+            elif k == "say":
+                out.append((ts, pre + "SAY", "say", e["text"]))
+            elif k == "think":
+                if e["text"]:
+                    out.append((ts, pre + "THINK", "think", e["text"] if expand else clip(e["text"], 15)))
+                elif expand:
+                    out.append((ts, pre + "THINK", "dim", "(thinking not recorded)"))
+            elif k == "cmd":
+                if e["desc"]:
+                    out.append((ts, pre + "#", "dim", e["desc"] + ("   [background]" if e["bg"] else "")))
+                out.append((ts, pre + "$", "cmd", e["text"]))
+            elif k == "tool":
+                out.append((ts, pre + "TOOL", "tool", f"{e['name']}  " + (e["text"] if expand else clip(e["text"], 3))))
+            else:
+                n = 14 if e.get("name") == "Bash" else 3
+                out.append((ts, pre + ("ERR" if k == "err" else "│"), "err" if k == "err" else "out",
+                            e["text"] if expand else clip(e["text"], n)))
+        return out
+
+
+def tool_detail(name, inp):
+    if name in ("Read", "Write", "Edit", "NotebookEdit"):
+        return inp.get("file_path", "")
+    if name in ("Grep", "Glob"):
+        return f"{inp.get('pattern', '')}  {inp.get('path', '')}"
+    if name == "Monitor":
+        return f"{inp.get('description', '')}\n{inp.get('command', '')}"
+    if name == "Agent":
+        return f"{inp.get('description', '')}: {inp.get('prompt', '')}"
+    return json.dumps(inp, ensure_ascii=False)
+
+
+def clip(text, n):
+    lines = text.split("\n")
+    if len(lines) <= n:
+        return text
+    head = max(n // 3, 1)
+    tail = n - head
+    return "\n".join(lines[:head] + [f"… {len(lines) - n} more lines (e to expand) …"] + lines[-tail:])
+
+
+# ---------------------------------------------------------------- log tabs
+
+class LogTab:
+    def __init__(self, path, label, pinned=False):
+        self.path, self.label, self.pinned = path, label, pinned
+        self.rows = collections.deque(maxlen=8000)
+        self.pos, self.part = None, ""
+        self.alive, self.pids, self.started, self.ended = False, [], None, None
+        self.unread, self.bottom = 0, None
+
+    def poll(self):
+        try:
+            size = os.path.getsize(self.path)
+        except OSError:
+            return 0
+        first = self.pos is None
+        if first:
+            self.pos = max(0, size - 512 * 1024)
+        if size < self.pos:
+            self.pos, self.part = 0, ""
+        if size == self.pos:
+            return 0
+        with open(self.path, "rb") as f:
+            f.seek(self.pos)
+            data = f.read(8 << 20)
+        self.pos += len(data)
+        lines = (self.part + data.decode("utf-8", "replace")).split("\n")
+        self.part = lines.pop()
+        if first and self.pos > len(data) and lines:
+            lines.pop(0)
+        for l in lines:
+            l = ANSI.sub("", l)
+            if "\r" in l:
+                l = l.rstrip("\r").split("\r")[-1]
+            self.rows.append(l)
+        return len(lines)
+
+    def all_rows(self):
+        r = list(self.rows)
+        if self.part:
+            r.append(ANSI.sub("", self.part).split("\r")[-1])
+        return r
+
+
+class View:
+    """One agent: Activity tab + one tab per output file of its running/finished commands."""
+
+    def __init__(self, agent, pinned=()):
+        self.agent = agent
+        self.feed = Feed(agent)
+        self.tabs = collections.OrderedDict()
+        for p in pinned:
+            self.tabs[p] = LogTab(p, os.path.basename(p), pinned=True)
+        self.sel = None          # path of the selected tab, None = Activity
+        self.dismissed = {}      # path -> when the user closed it; stays closed until a new process writes there
+        self.act_bottom, self.act_unread = None, 0
+        self.expand = False
+        self.rows_cache, self.rows_key = [], None
+
+    def tasks_dirs(self):
+        name = os.path.basename(self.agent.projdir)
+        return glob.glob(f"{tempfile.gettempdir()}/claude-{os.getuid()}/{name}/*/tasks/*.output")
+
+    def refresh(self, procs):
+        now = time.time()
+        jobs = agent_jobs(procs, self.agent.sessions())
+        for f, ps in list(jobs.items()):
+            if f in self.dismissed:
+                if min(p["start"] for p in ps) > self.dismissed[f]:
+                    del self.dismissed[f]   # something new started writing here: show it again
+                else:
+                    del jobs[f]
+        for f in self.tasks_dirs():   # finished background tasks
+            if f not in jobs and f not in self.tabs and f not in self.dismissed and now - os.path.getmtime(f) < KEEP_DONE and os.path.getsize(f):
+                t = self.tabs[f] = LogTab(f, self.label_for(f, []))
+                t.ended = os.path.getmtime(f)
+        owner = {}   # pid -> task output file its shell writes to
+        for f, ps in jobs.items():
+            if f.endswith(".output") and "/tasks/" in f:
+                for p in ps:
+                    owner[p["pid"]] = f
+
+        def task_of(ps):
+            for p in ps:
+                q = procs.get(p["ppid"])
+                while q:
+                    if q["pid"] in owner:
+                        return owner[q["pid"]]
+                    q = procs.get(q["ppid"])
+            return None
+
+        parents = {task_of(ps) for f, ps in jobs.items()} - {None}
+        for f in list(jobs):   # a silent task shell whose child writes its own log: show only the log
+            if f in parents and not os.path.getsize(f) and f not in self.tabs:
+                del jobs[f]
+        for f, ps in jobs.items():
+            t = self.tabs.get(f)
+            if t is None:
+                t = self.tabs[f] = LogTab(f, self.label_for(f, ps, task_of(ps)))
+            if not t.alive and not t.pinned:
+                t.label = self.label_for(f, ps, task_of(ps))
+            t.alive, t.ended = True, None
+            t.pids = sorted(p["pid"] for p in ps)
+            t.started = min(p["start"] for p in ps)
+        for f, t in list(self.tabs.items()):
+            if f not in jobs and t.alive:
+                t.alive, t.ended = False, now
+            if t.alive or t.pinned or f == self.sel:
+                continue
+            gone = not os.path.exists(f)
+            if t.ended and now - t.ended > (KEEP_GONE if gone else KEEP_DONE):
+                del self.tabs[f]
+        done = [t for t in self.ordered() if not t.alive and not t.pinned and t.path != self.sel]
+        for t in done[MAX_DONE:]:
+            del self.tabs[t.path]
+
+    def ordered(self):
+        """Pinned tabs, then running (oldest first), then finished (most recent first)."""
+        tabs = list(self.tabs.values())
+        pinned = [t for t in tabs if t.pinned]
+        running = sorted((t for t in tabs if t.alive and not t.pinned), key=lambda t: t.started or 0)
+        done = sorted((t for t in tabs if not t.alive and not t.pinned), key=lambda t: -(t.ended or 0))
+        return pinned + running + done
+
+    def keys(self):
+        return [None] + [t.path for t in self.ordered()]
+
+    def select(self, step=None, index=None):
+        keys = self.keys()
+        if index is None:
+            i = keys.index(self.sel) if self.sel in keys else 0
+            index = (i + step) % len(keys)
+        if 0 <= index < len(keys):
+            self.sel = keys[index]
+
+    def label_for(self, f, ps, parent_task=None):
+        tid = os.path.basename(f)[:-7] if f.endswith(".output") and "/tasks/" in f else None
+        if not tid and parent_task:
+            ptid = os.path.basename(parent_task)[:-7]
+            if ptid in self.feed.task_desc:
+                return self.feed.task_desc[ptid]
+        if tid and tid in self.feed.task_desc:
+            return self.feed.task_desc[tid]
+        if tid:   # foreground command: name it after the agent's running Bash call
+            running = [v for v in self.feed.running() if v[2] == "Bash"]
+            if running:
+                return running[-1][1]
+        return proc_label(ps) or (f"task {tid}" if tid else os.path.basename(f))
+
+    def poll(self):
+        before = self.feed.total
+        self.feed.poll()
+        new = self.feed.total - before
+        if new and self.sel is not None:
+            self.act_unread += new
+        for t in self.tabs.values():
+            fresh = t.pos is None
+            n = t.poll()
+            if n and not fresh and self.current() is not t:
+                t.unread += n
+
+    def close(self, t):
+        """Hide a tab (the process keeps running) until something new writes to its file."""
+        self.dismissed[t.path] = time.time()
+        self.tabs.pop(t.path, None)
+
+    def current(self):
+        t = self.tabs.get(self.sel)
+        if t is None:
+            self.sel = None
+        return t
+
+    def act_rows(self):
+        key = (self.feed.total, self.expand)
+        if key != self.rows_key:
+            self.rows_cache, self.rows_key = self.feed.rows(self.expand), key
+        return self.rows_cache
+
+    def running_count(self):
+        return sum(1 for t in self.tabs.values() if t.alive)
+
+
+# ---------------------------------------------------------------- drawing
+
+STYLES = {}
+
+
+def init_colors():
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+        bg = -1
+    except curses.error:
+        bg = curses.COLOR_BLACK
+    spec = dict(say=(curses.COLOR_CYAN, 0), think=(curses.COLOR_MAGENTA, 0), cmd=(curses.COLOR_YELLOW, curses.A_BOLD),
+                msg=(curses.COLOR_GREEN, 0), err=(curses.COLOR_RED, 0), tool=(curses.COLOR_BLUE, curses.A_BOLD),
+                out=(-1, 0), dim=(-1, curses.A_DIM), warn=(curses.COLOR_YELLOW, 0), ok=(curses.COLOR_GREEN, curses.A_BOLD))
+    for i, (k, (fg, attr)) in enumerate(spec.items(), 1):
+        curses.init_pair(i, fg, bg)
+        STYLES[k] = curses.color_pair(i) | attr
+    curses.init_pair(20, curses.COLOR_BLACK, curses.COLOR_CYAN)
+    STYLES["tabsel"] = curses.color_pair(20) | curses.A_BOLD
+    curses.init_pair(21, curses.COLOR_BLACK, curses.COLOR_WHITE)
+    STYLES["bar"] = curses.color_pair(21)
+
+
+def put(win, y, x, text, attr=0):
+    h, w = win.getmaxyx()
+    if y >= h or x >= w:
+        return x
+    text = CTRL.sub("", text)[: max(w - x - (1 if y == h - 1 else 0), 0)]
+    try:
+        win.addstr(y, x, text, attr)
+    except (curses.error, ValueError):
+        pass
+    return x + len(text)
+
+
+def wrap(text, width):
+    out = []
+    for ln in text.split("\n"):
+        ln = ln.expandtabs(4)
+        while len(ln) > width:
+            out.append(ln[:width])
+            ln = ln[width:]
+        out.append(ln)
+    return out
+
+
+def act_lines(row, width):
+    ts, tag, style, text = row
+    pre = 16
+    body = wrap(text, max(width - pre, 10))
+    tagstyle = {"dim": "dim", "out": "dim"}.get(style, style)
+    first = [(STYLES["dim"], f"{ts:<8} "), (STYLES[tagstyle], f"{tag:<6} "), (STYLES[style], body[0])]
+    return [first] + [[(0, " " * pre), (STYLES[style], b)] for b in body[1:]]
+
+
+LOG_ERR = re.compile(r"\b(ERROR|FATAL|panic|panicked|Traceback|failed|error:)", re.I)
+LOG_WARN = re.compile(r"\bWARN", re.I)
+
+
+def log_lines(row, width):
+    style = STYLES["err"] if LOG_ERR.search(row) else STYLES["warn"] if LOG_WARN.search(row) else 0
+    return [[(style, l)] for l in wrap(row, width)]
+
+
+def draw_body(win, top, height, width, rows, bottom, render):
+    """Render logical rows so that row `bottom` (None = last) ends at the bottom of the area."""
+    if not rows:
+        put(win, top, 1, "(nothing yet)", STYLES["dim"])
+        return
+    end = len(rows) - 1 if bottom is None else max(0, min(bottom, len(rows) - 1))
+    lines, i = [], end
+    while i >= 0 and len(lines) < height:
+        lines[0:0] = render(rows[i], width)
+        i -= 1
+    for y, segs in enumerate(lines[-height:]):
+        x = 0
+        for attr, s in segs:
+            x = put(win, top + y, x, s, attr)
+
+
+def draw_view(win, v):
+    h, w = win.getmaxyx()
+    win.erase()
+    now = time.time()
+    age = now - v.agent.last_write()
+    state = "working" if age < 20 else f"idle {ago(age)}"
+    running = v.feed.running()
+    ndone = len(v.tabs) - v.running_count()
+    hdr = f" {v.agent.name} · {state} · {v.running_count()} running · {ndone} finished"
+    if running and age < 11 * 60:
+        hdr += f" · now: {running[-1][1]} ({ago(now - running[-1][0])})"
+    put(win, 0, 0, hdr.ljust(w), STYLES["bar"])
+
+    # tab bar: Activity | running ... ┃ finished ...
+    order = v.ordered()
+    items = [(None, "1 Activity" + (f" +{v.act_unread}" if v.act_unread else ""))]
+    for i, t in enumerate(order, 2):
+        mark = "≡" if t.pinned else "●" if t.alive else "✓"
+        lab = t.label if len(t.label) <= 26 else t.label[:25] + "…"
+        unread = f" +{t.unread}" if 0 < t.unread < 1000 else " +999" if t.unread else ""
+        items.append((t, f"{i if i <= 9 else ''} {mark} {lab}".strip() + unread))
+    sel_i = next((i for i, (t, _) in enumerate(items) if (t.path if t else None) == v.sel), 0)
+    first_done = next((t for t in order if not t.alive and not t.pinned), None)
+    cells = [(t, f" {lab} ", "┃" if t is first_done and t is not None else "│") for t, lab in items]
+    # pick a window of tabs around the selection that fits the width
+    lo = hi = sel_i
+    used = len(cells[sel_i][1]) + 1
+    while True:
+        grew = False
+        for j in (hi + 1, lo - 1):
+            if 0 <= j < len(cells) and (j > hi or j < lo) and used + len(cells[j][1]) + 1 <= w - 8:
+                used += len(cells[j][1]) + 1
+                lo, hi = min(lo, j), max(hi, j)
+                grew = True
+        if not grew:
+            break
+    x = put(win, 1, 0, f"«{lo} " if lo else "", STYLES["dim"])
+    for i in range(lo, hi + 1):
+        t, lab, sep = cells[i]
+        if i > lo or lo:
+            x = put(win, 1, x, sep, STYLES["warn"] if sep == "┃" else STYLES["dim"])
+        st = STYLES["tabsel"] if i == sel_i else (STYLES["ok"] if t and t.alive else STYLES["dim"] if t else 0)
+        x = put(win, 1, x, lab, st)
+    if hi < len(cells) - 1:
+        put(win, 1, x, f" {len(cells) - 1 - hi}»", STYLES["dim"])
+
+    t = v.current()
+    top, bottom_row = 2, h - 1
+    if t is None:
+        follow = v.act_bottom is None
+        draw_body(win, top, bottom_row - top, w, v.act_rows(), v.act_bottom, act_lines)
+    else:
+        if t.alive:
+            info = f" running {ago(now - t.started)} · pid {','.join(map(str, t.pids[:4]))} · {t.path}"
+        else:
+            info = f" finished {ago(now - (t.ended or now))} ago · {t.path}"
+        put(win, 2, 0, info.ljust(w), STYLES["dim"] | curses.A_REVERSE)
+        follow = t.bottom is None
+        draw_body(win, 3, bottom_row - 3, w, t.all_rows(), t.bottom, log_lines)
+    foot = " ←/→ tabs  ↑/↓ PgUp/PgDn scroll  G follow  e expand  x close tab  X close finished  a agents  q quit "
+    mode = " FOLLOW " if follow else " PAUSED (G to follow) "
+    put(win, h - 1, 0, foot.ljust(w - len(mode))[: w - len(mode)], STYLES["bar"])
+    put(win, h - 1, max(w - len(mode) - 1, 0), mode, STYLES["tabsel"] if follow else STYLES["err"] | curses.A_REVERSE)
+    win.refresh()
+
+
+def draw_picker(win, agents, sel, stats):
+    h, w = win.getmaxyx()
+    win.erase()
+    put(win, 0, 0, " obwatch · pick an agent (↑/↓, Enter, q) ".ljust(w), STYLES["bar"])
+    now = time.time()
+    for i, a in enumerate(agents):
+        lw, live = stats.get(a.projdir, (0, 0))
+        if a.provider != "claude":
+            st = f"{a.provider}: not supported"
+        elif not lw:
+            st = "no sessions yet"
+        else:
+            st = ("working" if now - lw < 20 else f"idle {ago(now - lw)}") + (f" · {live} running" if live else "")
+        line = f" {'›' if i == sel else ' '} {a.name:<24.24} {st}"
+        attr = STYLES["tabsel"] if i == sel else (STYLES["dim"] if a.provider != "claude" else 0)
+        put(win, 2 + i, 0, line.ljust(w), attr)
+    win.refresh()
+
+
+# ---------------------------------------------------------------- main loop
+
+def tui(stdscr, args, agents, start):
+    curses.curs_set(0)
+    init_colors()
+    stdscr.timeout(300)
+    views, view = {}, None
+    sel = 0
+    if start is not None:
+        view = views[start.projdir] = View(start, args.follow)
+        view.poll()
+    procs, last_scan, stats = {}, 0, {}
+    while True:
+        now = time.time()
+        if now - last_scan > 1.5:
+            procs, last_scan = scan_procs(), now
+            if view:
+                view.refresh(procs)
+            else:
+                stats = {a.projdir: (a.last_write(), sum(1 for f in agent_jobs(procs, a.sessions()) if os.path.getsize(f)))
+                         for a in agents}
+        if view:
+            view.poll()
+            draw_view(stdscr, view)
+        else:
+            draw_picker(stdscr, agents, sel, stats)
+        k = stdscr.getch()
+        if k == -1:
+            continue
+        if k in (ord("q"), ord("Q")):
+            return
+        if view is None:
+            if k in (curses.KEY_UP, ord("k")):
+                sel = max(sel - 1, 0)
+            elif k in (curses.KEY_DOWN, ord("j")):
+                sel = min(sel + 1, len(agents) - 1)
+            elif k in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT):
+                a = agents[sel]
+                view = views.get(a.projdir) or views.setdefault(a.projdir, View(a, args.follow))
+                view.poll()
+                last_scan = 0
+            continue
+        t = view.current()
+        page = max(stdscr.getmaxyx()[0] // 2, 1)
+        rows_len = len(view.act_rows()) if t is None else len(t.all_rows())
+        cur = (view.act_bottom if t is None else t.bottom)
+        cur = rows_len - 1 if cur is None else cur
+        newb = "same"
+        if k in (ord("a"), 27):
+            view = None
+            last_scan = 0
+        elif k in (9, curses.KEY_RIGHT, ord("l")):
+            view.select(step=1)
+        elif k in (curses.KEY_BTAB, curses.KEY_LEFT, ord("h")):
+            view.select(step=-1)
+        elif ord("1") <= k <= ord("9"):
+            view.select(index=k - ord("1"))
+        elif k in (curses.KEY_UP, ord("k")):
+            newb = max(cur - 1, 0)
+        elif k in (curses.KEY_DOWN, ord("j")):
+            newb = cur + 1
+        elif k == curses.KEY_PPAGE:
+            newb = max(cur - page, 0)
+        elif k in (curses.KEY_NPAGE, ord(" ")):
+            newb = cur + page
+        elif k in (ord("g"), curses.KEY_HOME):
+            newb = 0
+        elif k in (ord("G"), curses.KEY_END, ord("f")):
+            newb = None
+        elif k == ord("e"):
+            view.expand = not view.expand
+            view.act_bottom = None
+        elif k == ord("x") and t is not None:
+            view.select(step=-1)
+            view.close(t)
+        elif k == ord("X"):
+            for tab in list(view.tabs.values()):
+                if not tab.alive and not tab.pinned:
+                    view.close(tab)
+            view.current()
+        if newb != "same":
+            if newb is not None and newb >= rows_len - 1:
+                newb = None
+            if t is None:
+                view.act_bottom = newb
+            else:
+                t.bottom = newb
+        if view:
+            t = view.current()
+            if t is None:
+                view.act_unread = 0
+            else:
+                t.unread = 0
+
+
+def plain(agent):
+    colors = dict(say="\033[36m", think="\033[35m", cmd="\033[1;33m", msg="\033[32m", err="\033[31m",
+                  tool="\033[1;34m", out="", dim="\033[2m")
+    feed, shown = Feed(agent), 0
+    try:
+        while True:
+            feed.poll()
+            rows = feed.rows(False)
+            new = feed.total - shown
+            for ts, tag, style, text in rows[-new:] if new and shown else rows[-40:] if new else []:
+                c = colors[style]
+                lines = text.split("\n")
+                print(f"\033[2m{ts}\033[0m {c}{tag:<6} {lines[0]}\033[0m")
+                for l in lines[1:]:
+                    print(f"{' ' * 16}{c}{l}\033[0m")
+            shown = feed.total
+            sys.stdout.flush()
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("agent", nargs="?", help="part of the agent's name or id")
+    ap.add_argument("-f", "--follow", action="append", default=[], help="pin this log file as a tab (repeatable)")
+    ap.add_argument("--plain", action="store_true", help="stream the activity feed without the TUI")
+    ap.add_argument("--version", action="version", version=f"obwatch {__version__}")
+    args = ap.parse_args()
+    args.follow = [os.path.abspath(os.path.expanduser(p)) for p in args.follow]
+    agents = load_agents()
+    start = None
+    if args.agent:
+        hits = [a for a in agents if args.agent.lower() in (a.name + " " + a.id).lower()]
+        if len(hits) != 1:
+            names = ", ".join(a.name for a in hits) if hits else ", ".join(a.name for a in agents)
+            sys.exit(f"{'Several' if hits else 'No'} agents match '{args.agent}': {names}")
+        start = hits[0]
+    if args.plain:
+        if not start:
+            sys.exit("--plain needs an agent name")
+        return plain(start)
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    curses.wrapper(tui, args, agents, start)
+
+
+if __name__ == "__main__":
+    main()
