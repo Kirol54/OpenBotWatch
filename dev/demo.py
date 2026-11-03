@@ -16,6 +16,39 @@ WORKSPACE = "/home/demo/OpenBot/Agents/agent-demo-coder"
 PROJ = WORKSPACE.replace("/", "-")
 TASKS = f"{tempfile.gettempdir()}/claude-{os.getuid()}/{PROJ}/{SESSION}/tasks"
 LOGS = f"{ROOT}/app/logs"
+NOTES = f"{ROOT}/app/CHANGES.md"
+NOTES_TEXT = """# Checkout fix
+
+Carts created **before** this morning's deploy have no `currency` field, so `cart_total` raised `KeyError`.
+
+TODO: confirm with support before closing.
+
+## What changed
+- `cart_total` defaults to the store currency (`USD`)
+- Legacy carts return a total again instead of a 500
+
+| Check | Result |
+|---|---|
+| Unit tests | 97 passed |
+| Legacy cart | `{"total": "48.20"}` |
+
+```python
+rate = RATES[cart.get("currency", "USD")]
+```
+"""
+NOTES_EDITS = [   # (seconds ago, old text, new text): later edits to the notes, to show the marked Markdown view
+    (170, "- Legacy carts return a total again instead of a 500\n",
+          "- Legacy carts return a total again instead of a 500\n- Integration tests run against the rebuilt image\n"),
+    (160, "| Unit tests | 97 passed |", "| Unit tests | 98 passed (one new test for legacy carts) |"),
+    (150, "raised `KeyError`.", "raised `KeyError` and the checkout page showed a blank error."),
+    (145, "error.\n\nTODO: confirm with support before closing.\n\n## What", "error.\n\n## What"),
+    (140, "```python\nrate = RATES[cart.get(\"currency\", \"USD\")]\n```\n",
+          "```python\nrate = RATES[cart.get(\"currency\", \"USD\")]\n```\n\n## Follow-up\n\n"
+          "Backfill the `currency` field on old carts, then remove the default.\n"),
+]
+NOTES_FINAL = NOTES_TEXT
+for _, _old, _new in NOTES_EDITS:
+    NOTES_FINAL = NOTES_FINAL.replace(_old, _new, 1)
 PIDS = f"{ROOT}/pids"
 
 AGENTS = [
@@ -134,6 +167,10 @@ def transcript():
     tool(190, "Bash", {"command": "curl -s -X POST localhost:8080/api/checkout/totals -d @fixtures/legacy-cart.json",
                        "description": "Retry a legacy cart against the fixed server"},
          '{"total": "48.20", "currency": "USD"}')
+    tool(185, "Write", {"file_path": NOTES, "content": NOTES_TEXT}, f"File created successfully at: {NOTES}")
+    for sec, old, new in NOTES_EDITS:
+        tool(sec, "Edit", {"file_path": NOTES, "old_string": old, "new_string": new},
+             f"The file {NOTES} has been updated successfully.")
     tool(180, "Bash", {"command": "docker build -t shop-api:dev .", "description": "Build the Docker image",
                        "run_in_background": True},
          "Command running in background with ID: bdocker01. Output is being written to: " + TASKS + "/bdocker01.output")
@@ -273,6 +310,8 @@ def start():
         f.write(json.dumps({"type": "assistant", "timestamp": iso(7300), "message": {"content": [
             {"type": "text", "text": "Summary is in compare-queues.md."}]}}) + "\n")
     os.utime(f"{research}/old-session.jsonl", (time.time() - 7300,) * 2)
+    with open(NOTES, "w") as f:
+        f.write(NOTES_FINAL)
     with open(f"{TASKS}/bdone0001.output", "w") as f:
         f.write("........................................................... [ 61%]\n"
                 "....................................                        [100%]\n"

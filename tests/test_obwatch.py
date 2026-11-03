@@ -1,5 +1,5 @@
 """Tests for obwatch. Standard library only: python3 -m unittest discover -s tests"""
-import importlib.machinery, importlib.util, json, os, sqlite3, tempfile, time, unittest
+import importlib.machinery, importlib.util, json, os, re, sqlite3, tempfile, time, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _loader = importlib.machinery.SourceFileLoader("obwatch", os.path.join(HERE, "..", "obwatch"))
@@ -269,6 +269,301 @@ class OpencodeFeed(unittest.TestCase):
         before = feed.total
         feed.poll()                                                   # nothing new: nothing added
         self.assertEqual(feed.total, before)
+
+
+class Web(unittest.TestCase):
+    """The web server answers only with the token, and only to requests addressed to localhost."""
+
+    def test_token_and_host_checks(self):
+        import http.client, threading
+        from http.server import ThreadingHTTPServer
+        state = ow.WebState.__new__(ow.WebState)
+        state.lock, state.agents, state.views, state.focus = threading.Lock(), [], {}, {}
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ow.web_handler(state, "secret-token", 0))
+        port = server.server_address[1]
+        server.RequestHandlerClass = ow.web_handler(state, "secret-token", port)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        def get(path, **headers):
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("GET", path, headers=dict({"Host": f"localhost:{port}"}, **headers))
+            r = c.getresponse()
+            return r.status, r.read()
+        try:
+            self.assertEqual(get("/")[0], 200)
+            self.assertEqual(get("/api/agents")[0], 403)
+            self.assertEqual(get("/api/agents", **{"X-Obwatch-Token": "wrong"})[0], 403)
+            self.assertEqual(get("/api/agents", **{"X-Obwatch-Token": "secret-token"}), (200, b'{"agents": []}'))
+            self.assertEqual(get("/api/agents", Host="evil.example", **{"X-Obwatch-Token": "secret-token"})[0], 403)
+            self.assertEqual(get("/api/agent?id=nope", **{"X-Obwatch-Token": "secret-token"})[0], 404)
+            # the printed link sets a cookie, which then works without the header
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("GET", "/?token=secret-token", headers={"Host": f"localhost:{port}"})
+            r = c.getresponse(); r.read()
+            self.assertEqual(r.status, 303)
+            cookie = r.getheader("Set-Cookie")
+            self.assertIn("HttpOnly", cookie)
+            self.assertIn("SameSite=Strict", cookie)
+            self.assertEqual(get("/api/agents", Cookie=cookie.split(";")[0])[0], 200)
+            self.assertEqual(get("/api/agents", Cookie=f"obwatch_{port}=wrong")[0], 403)
+            self.assertEqual(get("/?token=wrong")[0], 200)   # the page loads and tells you to use the right link
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_access_log(self):
+        import io
+        out = io.StringIO()
+        log = ow.AccessLog(out)
+        log.request("192.0.2.23", "GET / HTTP/1.1", 200)
+        log.request("192.0.2.23", "GET /api/agents HTTP/1.1", 200)
+        log.request("192.0.2.23", "GET /api/agents HTTP/1.1", 403, "missing or wrong token")
+        text = out.getvalue()
+        self.assertIn("new client", text)
+        self.assertIn("GET / HTTP/1.1  → 200", text)
+        self.assertNotIn("GET /api/agents HTTP/1.1  → 200", text)     # live updates are summarized
+        self.assertIn("→ 403  missing or wrong token", text)
+        log.flushed -= 61
+        log.request("192.0.2.23", "GET /api/agents HTTP/1.1", 200)
+        self.assertIn("2 live updates OK in the last minute", out.getvalue())
+
+    def test_page_javascript_parses(self):
+        import shutil, subprocess
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node isn't installed")
+        page = ow.WEB_PAGE
+        js = page[page.index("<script>") + 8:page.rindex("</script>")]
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(js)
+        try:
+            r = subprocess.run([node, "--check", f.name], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+        finally:
+            os.unlink(f.name)
+
+    def test_client_allowed(self):
+        import ipaddress
+        lan = ipaddress.ip_network("192.0.2.0/24")
+        self.assertTrue(ow.client_allowed("192.0.2.23", lan))
+        self.assertTrue(ow.client_allowed("127.0.0.1", lan))
+        self.assertFalse(ow.client_allowed("198.51.100.5", lan))      # a VPN peer
+        self.assertFalse(ow.client_allowed("203.0.113.2", lan))       # a container
+        self.assertFalse(ow.client_allowed("192.0.2.23", None))    # without --lan: this machine only
+
+    def test_file_change_diffs(self):
+        c = ow.file_change("Edit", {"file_path": "/x/a.py", "old_string": "a = 1", "new_string": "a = 2"})
+        self.assertEqual(c["file"], "/x/a.py")
+        self.assertIn("-a = 1", c["diff"])
+        self.assertIn("+a = 2", c["diff"])
+        self.assertIn("+++ b/x/a.py", c["diff"])
+        self.assertEqual(ow.file_change("edit", {"path": "b"}, {"files": [{"patch": "P"}]})["diff"], "P")
+        self.assertIsNone(ow.file_change("Read", {"file_path": "/x"}))
+
+
+class ClaudeAccounts(unittest.TestCase):
+    def test_sessions_found_in_every_account_folder(self):
+        """OpenBot keeps each Claude account's sessions in its own folder; switching accounts moves new ones there."""
+        saved = ow.PROJECTS, ow.PROVIDER_ACCOUNTS, ow.HOME, ow._roots
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                ow.HOME, ow.PROJECTS = tmp, os.path.join(tmp, ".claude", "projects")
+                ow.PROVIDER_ACCOUNTS, ow._roots = os.path.join(tmp, "accounts"), (0, [])
+                a = ow.make_agent("agent-demo", {"name": "Demo", "provider": "claude", "workspacePath": "/home/demo/ws"})
+                old = os.path.join(ow.PROJECTS, "-home-demo-ws")
+                new = os.path.join(tmp, "accounts", "acct2", "projects", "-home-demo-ws")
+                for d, sid in ((old, "s-old"), (new, "s-new")):
+                    os.makedirs(d)
+                    with open(os.path.join(d, sid + ".jsonl"), "w") as f:
+                        f.write(json.dumps({"type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                                            "message": {"role": "user", "content": sid}}) + "\n")
+                self.assertEqual(a.sessions(), {"s-old", "s-new"})
+                feed = a.make_feed(); feed.poll()
+                self.assertEqual(sorted(e["text"] for e in feed.events), ["s-new", "s-old"])
+            finally:
+                ow.PROJECTS, ow.PROVIDER_ACCOUNTS, ow.HOME, ow._roots = saved
+
+
+class MarkdownHistory(unittest.TestCase):
+    """file_history: when each line of a Markdown file got its text, from the agent's edits."""
+
+    def edit(self, old, new, all=False):
+        return dict(ops=[dict(old=old, new=new, all=all)])
+
+    def test_lines_get_the_edit_that_wrote_them(self):
+        steps = [dict(ops=[dict(write="# T\n\nintro\n\n- a\n- b\n")]),
+                 self.edit("- b\n", "- b\n- c\n"),
+                 self.edit("intro", "intro changed"),
+                 self.edit("- a\n- b\n", "- b\n"),       # removes a line (edits carry some context)
+                 self.edit("missing", "zzz")]             # failed or overwritten: can't be traced
+        h = ow.file_history("# T\n\nintro changed\n\n- b\n- c\n", steps)
+        self.assertEqual(h["lines"], [0, 0, 2, 0, 0, 1])
+        self.assertEqual(h["kind"], ["add", "add", "mod", "add", "add", "add"])
+        self.assertEqual(h["unmatched"], 1)
+        mods = [r for r in h["removed"] if r["mod"]]
+        gone = [r for r in h["removed"] if not r["mod"]]
+        self.assertEqual((mods[0]["at"], mods[0]["text"], mods[0]["step"]), (2, "intro", 2))
+        self.assertEqual((gone[0]["at"], gone[0]["text"], gone[0]["step"]), (4, "- a", 3))
+
+    def test_edit_changed_again_elsewhere_is_matched_by_content(self):
+        steps = [dict(ops=[dict(write="intro\n")]),
+                 self.edit("intro\n", "intro\nA long line the agent added\nshort\n")]
+        h = ow.file_history("intro\nA long line the agent added\nshort, edited by someone else\n", steps)
+        self.assertEqual(h["unmatched"], 1)
+        self.assertEqual(h["lines"], [0, 1, 0])
+
+    def test_file_older_than_the_session(self):
+        h = ow.file_history("x\nnew\ny\n", [self.edit("x\ny", "x\nnew\ny")])
+        self.assertEqual(h["lines"], [-1, 0, -1])   # -1: was there before the agent's edits
+
+    def test_undo_edit_picks_the_only_safe_place(self):
+        self.assertEqual(ow.undo_edit("a b a", dict(old="c", new="b")), "a c a")
+        self.assertEqual(ow.undo_edit("x x", dict(old="y", new="x", all=True)), "y y")
+        self.assertIsNone(ow.undo_edit("abc", dict(old="q", new="z")))
+        # "X" twice: undoing the second would leave "aX" twice, which Edit wouldn't have allowed
+        self.assertEqual(ow.undo_edit("aX X", dict(old="aX", new="X")), "aaX X")
+        self.assertIsNone(ow.undo_edit("ok ok", dict(old="z", new="ok")))   # either place fits: don't guess
+
+    def test_ops_kept_for_history_but_not_sent_to_the_page(self):
+        c = ow.file_change("Edit", {"file_path": "/x/a.md", "old_string": "a", "new_string": "b"})
+        self.assertEqual(c["ops"], [dict(old="a", new="b", all=False)])
+        e = ow.WebState.event(dict(seq=1, ts="", kind="tool", text="", change=c))
+        self.assertNotIn("ops", e["change"])
+
+
+class Uncommitted(unittest.TestCase):
+    def test_git_baseline_marks_everything_not_committed(self):
+        """Changes made with shell commands have no edit to trace; git still shows them."""
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            git = lambda *a: subprocess.run(["git", "-c", "commit.gpgsign=false", "-c", "user.name=t", "-c", "user.email=" + "t" + "@" + "example.com", *a],
+                                            cwd=d, check=True, capture_output=True)
+            git("init", "-q")
+            path = os.path.join(d, "notes.md")
+            with open(path, "w") as f:
+                f.write("# Notes\n\nold line\n\nkept\n")
+            git("add", "."); git("commit", "-qm", "start")
+            self.assertIsNone(ow.git_base(os.path.join(d, "new.md"))["text"])   # not committed yet
+            base = ow.git_base(path)
+            self.assertEqual(base["text"], "# Notes\n\nold line\n\nkept\n")
+            # one edit made with an edit tool after the commit, one line changed by a command
+            text = "# Notes\n\nnew line\n\nkept\n\nadded by edit\n"
+            steps = [dict(ops=[dict(old="kept\n", new="kept\n\nadded by edit\n")], epoch=base["time"] + 60)]
+            hist, extra = ow.mark_uncommitted(text, ow.file_history(text, steps), steps, base, base["time"] + 90)
+            self.assertEqual(hist["fresh"], [False, False, True, False, False, True, True])
+            self.assertEqual(hist["lines"][2], 1)                  # the extra "by a command" step
+            self.assertEqual(hist["lines"][6], 0)                  # the traced edit keeps its time
+            self.assertTrue(extra and extra[0]["outside"])
+            self.assertEqual([(r["text"], r["fresh"]) for r in hist["removed"]], [("old line", True)])
+        self.assertIsNone(ow.git_base("/nonexistent/x.md"))
+
+
+class Terminal(unittest.TestCase):
+    def test_websocket_frames(self):
+        import socket
+        a, b = socket.socketpair()
+        try:
+            for size in (5, 300, 70000):
+                payload = bytes(range(256)) * (size // 256) + b"x" * (size % 256)
+                mask = b"\x01\x02\x03\x04"   # browsers mask what they send
+                frame = bytearray(ow.ws_frame(payload, 2))
+                frame[1] |= 0x80
+                hdr = 2 + (2 if size >= 126 else 0) + (6 if size >= 65536 else 0)
+                a.sendall(bytes(frame[:hdr]) + mask + bytes(c ^ mask[i % 4] for i, c in enumerate(payload)))
+                self.assertEqual(ow.ws_read(b), (2, payload))
+            a.close()
+            with self.assertRaises(EOFError):
+                ow.ws_read(b)
+        finally:
+            b.close()
+        self.assertEqual(ow.ws_accept("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")   # RFC 6455's example
+
+    def test_terminal_needs_sign_in_and_same_origin(self):
+        import http.client, threading
+        from http.server import ThreadingHTTPServer
+        state = ow.WebState.__new__(ow.WebState)
+        state.lock, state.agents, state.views, state.focus = threading.Lock(), [], {}, {}
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ow.web_handler(state, "secret-token", 0))
+        port = server.server_address[1]
+        server.RequestHandlerClass = ow.web_handler(state, "secret-token", port)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        ws = {"Connection": "Upgrade", "Upgrade": "websocket", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+              "Sec-WebSocket-Version": "13", "Host": f"localhost:{port}"}
+
+        def get(path, **headers):
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            c.request("GET", path, headers=dict(ws, **headers))
+            r = c.getresponse()
+            return r.status
+        try:
+            me = f"http://localhost:{port}"
+            self.assertEqual(get("/term", Origin=me), 403)                                   # not signed in
+            self.assertEqual(get("/term", **{"X-Obwatch-Token": "secret-token", "Origin": "http://evil.example"}), 403)
+            self.assertEqual(get("/term", **{"X-Obwatch-Token": "secret-token"}), 403)      # no origin
+            self.assertEqual(get("/assets/xterm.js"), 403)
+            self.assertEqual(get("/assets/passwd", **{"X-Obwatch-Token": "secret-token"}), 404)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class Privacy(unittest.TestCase):
+    """The repo is public: nothing from the maintainer's machine, network or agents may be committed (see AGENTS.md).
+    With OBWATCH_CHECK_STAGED=1 (the pre-commit hook) it checks what is staged instead of the working tree."""
+    ROOT = os.path.dirname(HERE)
+    EXAMPLE_IPS = ("127.", "0.0.0.0", "192.0.2.", "198.51.100.", "203.0.113.")   # loopback, RFC 5737
+    PUBLIC = {"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"}   # published constants, not personal: the WebSocket handshake key (RFC 6455)
+    CHECKS = [
+        ("a home directory", re.compile(r"/home/(?!demo\b)[\w.-]+")),
+        ("an email address", re.compile(r"\b[\w.+-]+@(?!github\.com\b)[\w-]+(?:\.[\w-]+)+\b")),
+        ("a UUID", re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)),
+        ("an OpenBot agent id", re.compile(r"\bagent-[0-9a-f]{8}\b")),
+        ("an opencode session id", re.compile(r"\bses_(?!demo)[A-Za-z0-9]{12,}")),
+    ]
+
+    def files(self):
+        import subprocess
+        if os.environ.get("OBWATCH_CHECK_STAGED"):
+            names = subprocess.run(["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"], cwd=self.ROOT,
+                                   capture_output=True, text=True).stdout.split()
+            for n in names:
+                data = subprocess.run(["git", "show", ":" + n], cwd=self.ROOT, capture_output=True).stdout
+                yield n, data
+            return
+        for d, dirs, fs in os.walk(self.ROOT):
+            dirs[:] = [x for x in dirs if x not in (".git", "__pycache__")]
+            for f in fs:
+                with open(os.path.join(d, f), "rb") as fh:
+                    yield os.path.relpath(os.path.join(d, f), self.ROOT), fh.read()
+
+    @staticmethod
+    def private_words():
+        path = os.path.expanduser("~/.config/obwatch/private-words")   # never part of the repo
+        try:
+            with open(path) as f:
+                return [w.strip().lower() for w in f if w.strip() and not w.startswith("#")]
+        except OSError:
+            return []
+
+    def test_no_personal_data(self):
+        words, problems = self.private_words(), []
+        ip = re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?![\w.])")
+        for name, data in self.files():
+            if name.endswith((".png", ".jpg", ".gif")):
+                continue
+            text = data.decode("utf-8", "replace")
+            for n, line in enumerate(text.splitlines(), 1):
+                where = f"{name}:{n}"
+                for m in ip.finditer(line):
+                    if all(int(x) <= 255 for x in m.group(1).split(".")) and not m.group(1).startswith(self.EXAMPLE_IPS):
+                        problems.append(f"{where}: an IP address outside the example ranges: {m.group(1)}")
+                for what, rx in self.CHECKS:
+                    for m in rx.finditer(line):
+                        if m.group(0) not in self.PUBLIC:
+                            problems.append(f"{where}: {what}: {m.group(0)}")
+                low = line.lower()
+                problems += [f"{where}: a word from the private list" for w in words if w in low]
+        self.assertEqual(problems, [], "\n" + "\n".join(problems))
 
 
 if __name__ == "__main__":

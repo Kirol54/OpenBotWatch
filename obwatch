@@ -8,18 +8,24 @@ the Claude Code and opencode providers (opencode covers local LLMs too).
   obwatch coder           open the agent whose name contains "coder"
   obwatch coder -f FILE   also pin FILE as a tab
   obwatch coder --plain   no TUI, just stream the activity feed
+  obwatch --web           a web page with every agent (localhost only; see the printed link)
 
 Keys:  Tab/Shift-Tab or <-/->/1-9 switch tabs   Up/Down/PgUp/PgDn/g scroll
        G or End follow   e expand outputs   s subagent lines in Activity
        x / X close tab / all finished tabs
        a agent list      q quit
 """
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
-import argparse, collections, curses, datetime as dt, glob, json, locale, os, re, sqlite3, sys, tempfile, time
+import argparse, collections, curses, datetime as dt, difflib, glob, hmac, ipaddress, json, locale, os, re, secrets
+import socket, sqlite3, struct, sys, tempfile, threading, time
 
 HOME = os.path.expanduser("~")
 PROJECTS = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude"), "projects")
+# OpenBot gives each Claude account (subscription) its own Claude Code config folder, so an agent's sessions move
+# there when you switch accounts. obwatch reads all of them.
+PROVIDER_ACCOUNTS = os.path.join(HOME, ".config/OpenBot/provider-accounts")
+_roots = (0, [])
 DB = os.path.join(HOME, ".config/OpenBot/openbot.db")
 SIDEBAR = os.path.join(HOME, ".config/OpenBot/openbot-sidebar-layout-v1.json")
 OC_DATA = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share"), "opencode")
@@ -65,6 +71,17 @@ def boot_time():
 BOOT = boot_time()
 
 
+def claude_roots():
+    """Every folder Claude Code keeps session transcripts in: $CLAUDE_CONFIG_DIR, ~/.claude, and one per
+    OpenBot provider account. Looked up again every few seconds, so a newly added account is picked up."""
+    global _roots
+    if time.time() - _roots[0] > 5:
+        dirs = [PROJECTS, os.path.join(HOME, ".claude", "projects")]
+        dirs += sorted(glob.glob(os.path.join(PROVIDER_ACCOUNTS, "*", "projects")))
+        _roots = (time.time(), [d for i, d in enumerate(dirs) if d not in dirs[:i] and os.path.isdir(d)])
+    return _roots[1]
+
+
 def ago(sec):
     sec = int(max(sec, 0))
     if sec < 60:
@@ -79,7 +96,8 @@ def ago(sec):
 # ---------------------------------------------------------------- agents
 
 def ro_db(path):
-    return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+    # check_same_thread=False: the web server reads from its own threads (always under WebState.lock)
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2, check_same_thread=False)
 
 
 class OcDB:
@@ -112,8 +130,17 @@ class Agent:
         self.title = d.get("title") or ""
         self.provider = d.get("provider") or "?"
         self.workspace = d.get("workspacePath") or os.path.join(HOME, "OpenBot/Agents", aid)
-        self.projdir = os.path.join(PROJECTS, re.sub(r"[^A-Za-z0-9]", "-", self.workspace))
+        self.projname = re.sub(r"[^A-Za-z0-9]", "-", self.workspace)   # Claude Code's folder name for the workspace
+        self.projdir = os.path.join(PROJECTS, self.projname)   # identifies the agent; its sessions may be elsewhere too
         self._written = (0, 0)
+
+    def projdirs(self):
+        """The agent's transcript folders, one per Claude account it has run under."""
+        dirs = [self.projdir] + [os.path.join(r, self.projname) for r in claude_roots()]
+        return [d for i, d in enumerate(dirs) if d not in dirs[:i] and os.path.isdir(d)]
+
+    def proj_glob(self, *parts, recursive=False):
+        return [f for d in self.projdirs() for f in glob.glob(os.path.join(d, *parts), recursive=recursive)]
 
     @property
     def supported(self):
@@ -151,11 +178,11 @@ class ClaudeAgent(Agent):
     supported = True
 
     def sessions(self):
-        return {os.path.basename(p)[:-6] for p in glob.glob(os.path.join(self.projdir, "*.jsonl"))}
+        return {os.path.basename(p)[:-6] for p in self.proj_glob("*.jsonl")}
 
     def _last_write(self):
         ts = []
-        for p in glob.glob(os.path.join(self.projdir, "**/*.jsonl"), recursive=True):
+        for p in self.proj_glob("**/*.jsonl", recursive=True):
             try:
                 ts.append(os.path.getmtime(p))
             except OSError:
@@ -167,7 +194,7 @@ class ClaudeAgent(Agent):
         started, updated, where. Claude Code writes <session>/subagents/agent-*.jsonl with a .meta.json
         next to it (description, agentType, and finished: true when done)."""
         res = []
-        for f in glob.glob(os.path.join(self.projdir, "*", "subagents", "agent-*.jsonl")):
+        for f in self.proj_glob("*", "subagents", "agent-*.jsonl"):
             meta_file = f[:-6] + ".meta.json"
             try:
                 updated = os.path.getmtime(f)
@@ -181,7 +208,7 @@ class ClaudeAgent(Agent):
         return res
 
     def output_files(self):
-        name = os.path.basename(self.projdir)
+        name = self.projname
         files = glob.glob(f"{tempfile.gettempdir()}/claude-{os.getuid()}/{name}/*/tasks/*.output")
         # a background subagent's task file is a link to its transcript: it has a subagent tab instead
         return [f for f in files if not os.path.islink(f) or not os.readlink(f).endswith(".jsonl")]
@@ -328,11 +355,13 @@ def load_agents():
         agents = sidebar_order(agents, json.loads(read(SIDEBAR)))
     except (OSError, ValueError, AttributeError, TypeError):
         pass   # keep OpenBot's stored order
-    known = {a.projdir for a in agents}
-    for d in glob.glob(os.path.join(PROJECTS, "*")):   # transcripts without an OpenBot agent
-        if d not in known and glob.glob(os.path.join(d, "*.jsonl")):
-            a = ClaudeAgent(os.path.basename(d), {"name": os.path.basename(d)[-28:], "provider": "claude"})
-            a.projdir = d
+    known = {a.projname for a in agents}
+    for d in (d for r in claude_roots() for d in glob.glob(os.path.join(r, "*"))):   # transcripts without an OpenBot agent
+        name = os.path.basename(d)
+        if name not in known and glob.glob(os.path.join(d, "*.jsonl")):
+            known.add(name)
+            a = ClaudeAgent(name, {"name": name[-28:], "provider": "claude"})
+            a.projname, a.projdir = name, d
             agents.append(a)
     return agents
 
@@ -557,9 +586,10 @@ class Feed:
         self.tools, self.task_desc, self.pending = {}, {}, collections.OrderedDict()
         self.primed = False
         self.ctx = {}   # epoch, src (session file) and side (subagent?) of the record being read
+        self.change_ev = {}   # tool call id -> its file-change event, to mark edits that failed
 
     def poll(self):
-        files = glob.glob(os.path.join(self.agent.projdir, "**/*.jsonl"), recursive=True)
+        files = self.agent.proj_glob("**/*.jsonl", recursive=True)
         cutoff = time.time() - BACKLOG_HOURS * 3600
         for p in sorted(files, key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0):
             try:
@@ -587,8 +617,10 @@ class Feed:
         self.primed = True
 
     def ev(self, ts, kind, text, **kw):
-        self.events.append(dict(self.ctx, ts=ts, kind=kind, text=text, **kw))
+        e = dict(self.ctx, seq=self.total, ts=ts, kind=kind, text=text, **kw)
+        self.events.append(e)
         self.total += 1
+        return e
 
     def add(self, rec, src=None):
         t = rec.get("type")
@@ -623,13 +655,18 @@ class Feed:
                             bg=bool(inp.get("run_in_background")), side=side)
                     label = inp.get("description") or short_cmd(inp.get("command", ""))
                 else:
-                    self.ev(ts, "tool", tool_detail(name, inp), name=name.split("__")[-1], side=side)
+                    e = self.ev(ts, "tool", tool_detail(name, inp), name=name.split("__")[-1], side=side,
+                                change=file_change(name, inp))
+                    if e["change"]:
+                        self.change_ev[b.get("id")] = e
                     label = name.split("__")[-1]
                 self.pending[b.get("id")] = (epoch, label, name)
             elif bt == "tool_result":
                 tid = b.get("tool_use_id")
                 self.pending.pop(tid, None)
                 name, inp = self.tools.get(tid, ("?", {}))
+                if b.get("is_error") and tid in self.change_ev:   # e.g. old_string not found: nothing changed
+                    self.change_ev[tid]["change"]["failed"] = True
                 c = b.get("content")
                 if isinstance(c, list):
                     c = "\n".join(x.get("text", f"[{x.get('type')}]") for x in c)
@@ -683,6 +720,170 @@ def short_cmd(cmd, n=60):
     """A command as a one-line label."""
     first = cmd.strip().split("\n")[0]
     return (first[:n] + "…") if len(first) > n or "\n" in cmd.strip() else first
+
+
+def unified(old, new, path, limit=400):
+    name = path.lstrip("/")
+    lines = list(difflib.unified_diff(old.splitlines(), new.splitlines(), f"a/{name}", f"b/{name}", lineterm="", n=3))
+    return "\n".join(lines[:limit] + ([f"… {len(lines) - limit} more diff lines"] if len(lines) > limit else []))
+
+
+def file_change(name, inp, meta=None):
+    """{file, op, diff} for a tool call that edits or writes a file, else None."""
+    n = name.lower()
+    path = inp.get("file_path") or inp.get("path") or inp.get("filePath") or ""
+    if not path:
+        return None
+    # `ops` (never sent to the page) lets file_history() work out when each line of the file got its text.
+    if n == "edit":
+        old = inp.get("old_string", inp.get("oldString", "")) or ""
+        new = inp.get("new_string", inp.get("newString", "")) or ""
+        ops = [dict(old=old, new=new, all=bool(inp.get("replace_all", inp.get("replaceAll"))))]
+        for f in (meta or {}).get("files") or []:   # opencode records the patch it applied
+            if isinstance(f, dict) and f.get("patch"):
+                return dict(file=path, op="edit", diff=f["patch"], ops=ops)
+        return dict(file=path, op="edit", diff=unified(old, new, path), ops=ops)
+    if n == "multiedit":
+        edits = [e for e in inp.get("edits") or [] if isinstance(e, dict)]
+        diffs = [unified(e.get("old_string", ""), e.get("new_string", ""), path) for e in edits]
+        ops = [dict(old=e.get("old_string") or "", new=e.get("new_string") or "", all=bool(e.get("replace_all"))) for e in edits]
+        return dict(file=path, op="edit", diff="\n".join(diffs), ops=ops)
+    if n == "write":
+        return dict(file=path, op="write", diff=unified("", inp.get("content", ""), path),
+                    ops=[dict(write=inp.get("content") or "")])
+    return None
+
+
+def git_base(path):
+    """The last committed version of `path`, if it's in a git repository: dict(head, time, text), with text None
+    when the file isn't committed yet. None outside git. Only reads (no index refresh, no locks)."""
+    import subprocess
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", LC_ALL="C")
+    def git(*args, cwd):
+        r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, env=env, timeout=5)
+        return r.stdout if r.returncode == 0 else None
+    try:
+        real = os.path.realpath(path)
+        out = git("log", "-1", "--format=%h %ct", cwd=os.path.dirname(real))
+        top = git("rev-parse", "--show-toplevel", cwd=os.path.dirname(real))
+        if not out or not top:
+            return None
+        head, when = out.decode().split()
+        top = top.decode().strip()
+        body = git("show", "HEAD:./" + os.path.relpath(real, top), cwd=top)
+        return dict(head=head, time=float(when), text=None if body is None else body.decode("utf-8", "replace"))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def mark_uncommitted(text, hist, steps, base, mtime):
+    """Add to file_history's result what changed since the last commit, however it was changed: `fresh` (per line:
+    not committed yet) and removals with `fresh`. Changed lines no traced edit explains (the agent used a command,
+    or another program changed the file) go to an extra step at the end: `outside`, timed by the file's last save."""
+    cur = text.splitlines()
+    old = (base["text"] or "").replace("\r", "").splitlines()
+    outside = len(steps)
+    who, kind = list(hist["lines"]), list(hist["kind"])
+    fresh, removed, used = [False] * len(cur), [], False
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, cur, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        for j in range(j1, j2):
+            fresh[j] = True
+            if who[j] < 0 or (steps[who[j]].get("epoch") or 0) < base["time"]:
+                who[j], kind[j], used = outside, "mod" if tag == "replace" else "add", True
+        if i2 > i1:
+            gone = "\n".join(old[i1:i2])
+            step = next((r["step"] for r in hist["removed"] if r["text"] == gone
+                         and (steps[r["step"]].get("epoch") or 0) >= base["time"]), None)
+            if step is None:
+                step, used = outside, True
+            removed.append(dict(at=j1, step=step, text=gone, mod=j2 - j1, fresh=True))
+    removed += [dict(r, fresh=False) for r in hist["removed"] if not any(x["text"] == r["text"] for x in removed)]
+    extra = [dict(epoch=mtime, ts=time.strftime("%H:%M:%S", time.localtime(mtime)), seq=-1, side=False,
+                  write=False, outside=True)] if used else []
+    return dict(hist, lines=who, kind=kind, fresh=fresh, removed=removed), extra
+
+
+def undo_edit(text, op):
+    """`text` with one edit taken back (its new text replaced by its old text), or None if that can't be done
+    safely. If the new text appears more than once, the right place is the one where the old text then
+    appears exactly once (Edit requires that); if no single place qualifies, None."""
+    new, old = op.get("new"), op.get("old", "")
+    if not new or new not in text:
+        return None
+    if op.get("all"):
+        return text.replace(new, old)
+    spots, i = [], text.find(new)
+    while i >= 0 and len(spots) < 50:
+        spots.append(i)
+        i = text.find(new, i + 1)
+    if len(spots) == 1:
+        return text[:spots[0]] + old + text[spots[0] + len(new):]
+    fits = [t for t in (text[:i] + old + text[i + len(new):] for i in spots) if old and t.count(old) == 1]
+    return fits[0] if len(fits) == 1 else None
+
+
+def file_history(text, steps):
+    """When each line of a file got its current text, from the agent's edits.
+
+    `text` is the file now; `steps` are its edits, oldest first: dicts with `ops` (from file_change).
+    Works backwards from the current text, undoing each edit (its new text back to its old text), to get
+    every earlier version, then compares the versions in order. An edit that can't be undone (the file was
+    changed some other way since, or the edit failed) is skipped. A Write is the oldest version we know.
+
+    Returns dict(lines=[step index or -1 per current line], kind=["add"/"mod"/"" per line],
+    removed=[dict(at=line, step=i, text=old lines, mod=lines it was replaced by)], unmatched=n)."""
+    versions, order, cur, unmatched = [text], [], text, []
+    for k in range(len(steps) - 1, -1, -1):
+        ops = steps[k].get("ops") or []
+        if ops and "write" in ops[0]:
+            versions.append(""); order.append(k)   # what was there before a Write is unknown: count it all as written
+            break
+        prev = cur
+        for op in reversed(ops):
+            prev = undo_edit(prev, op)
+            if prev is None:
+                break
+        if prev is None or not ops:
+            unmatched.append(k)
+            continue
+        versions.append(prev); order.append(k)
+        cur = prev
+    versions.reverse(); order.reverse()
+    lines = versions[0].splitlines()
+    who, kind, removed = [-1] * len(lines), [""] * len(lines), []
+    for i, step in enumerate(order):
+        new = versions[i + 1].splitlines()
+        ops = difflib.SequenceMatcher(None, lines, new, autojunk=False).get_opcodes()
+        def moved(at):   # where a line position of the old version ended up in the new one
+            for tag, i1, i2, j1, j2 in ops:
+                if i1 <= at < i2 or (at == i2 == len(lines)):
+                    return j1 + (at - i1 if tag == "equal" else 0)
+            return len(new)
+        for r in removed:
+            r["at"] = moved(r["at"])
+        nwho, nkind = [], []
+        for tag, i1, i2, j1, j2 in ops:
+            if tag == "equal":
+                nwho += who[i1:i2]; nkind += kind[i1:i2]
+                continue
+            if tag in ("replace", "insert"):
+                nwho += [step] * (j2 - j1)
+                nkind += ["mod" if tag == "replace" else "add"] * (j2 - j1)
+            if tag in ("replace", "delete"):
+                removed.append(dict(at=j1, step=step, text="\n".join(lines[i1:i2]), mod=j2 - j1))
+        lines, who, kind = new, nwho, nkind
+    # Edits that couldn't be undone (the text was changed again some other way, e.g. by another agent): lines
+    # they added that are still in the file, word for word, are most likely theirs.
+    for k in sorted(unmatched):
+        added = set()
+        for op in steps[k].get("ops") or []:
+            added |= {l for l in (op.get("new") or "").splitlines() if len(l.strip()) >= 8} - set((op.get("old") or "").splitlines())
+        for i, l in enumerate(lines):
+            if l in added and who[i] < k:
+                who[i], kind[i] = k, "add"
+    return dict(lines=who, kind=kind, removed=removed, unmatched=len(unmatched))
 
 
 def tool_detail(name, inp):
@@ -791,7 +992,9 @@ class OcFeed(Feed):
                 self.ev(ts, "cmd", inp.get("command", ""), desc=inp.get("description", ""), bg=bool(inp.get("background")))
                 self.pending[key] = (epoch, inp.get("description") or short_cmd(inp.get("command", "")), "Bash")
             else:
-                self.ev(ts, "tool", tool_detail(name, inp), name=name)
+                e = self.ev(ts, "tool", tool_detail(name, inp), name=name, change=file_change(name, inp, meta))
+                if e["change"]:
+                    self.change_ev[key] = e
                 self.pending[key] = (epoch, name, name)
         if status in ("completed", "error") and (mid, i, "res") not in self.done:
             self.done.add((mid, i, "res"))
@@ -803,6 +1006,8 @@ class OcFeed(Feed):
             c = (c if isinstance(c, str) else json.dumps(c, ensure_ascii=False)).strip()
             done_ts = self.stamp((part.get("time") or {}).get("completed") or epoch * 1000)[0]
             failed = status == "error" or meta.get("exit") not in (None, 0)
+            if status == "error" and key in self.change_ev:
+                self.change_ev[key]["change"]["failed"] = True
             self.ev(done_ts, "err" if failed else "out", c or "(no output)", name="Bash" if shell else name)
 
 
@@ -821,6 +1026,7 @@ class LogTab:
     def __init__(self, path, label, pinned=False):
         self.path, self.label, self.pinned = path, label, pinned
         self.rows = collections.deque(maxlen=8000)
+        self.count = 0          # lines ever read; the web page asks for "lines after N"
         self.pos, self.part = None, ""
         self.alive, self.pids, self.started, self.ended = False, [], None, None
         self.unread, self.bottom = 0, None
@@ -850,6 +1056,7 @@ class LogTab:
             if "\r" in l:
                 l = l.rstrip("\r").split("\r")[-1]
             self.rows.append(l)
+            self.count += 1
         return len(lines)
 
     def all_rows(self):
@@ -910,6 +1117,7 @@ class ProcTab:
         self.unread, self.bottom, self.pos = 0, None, 0
         self.started = self.ended = None
         self.pids, self.rows, self.prev, self.summary = [], [], {}, ""
+        self.items, self.total_cpu, self.total_mem = [], 0, 0
 
     def poll(self):
         return 0
@@ -961,6 +1169,7 @@ class ProcTab:
             (kids[p["ppid"]] if p["ppid"] in byid else roots).append(p)
         readers = pipe_readers({p["out"] for p in aps if p["out"] and p["out"].startswith("pipe:")}, procs) if deep else {}
         rows = [("dim", PROC_HINT), ("head", f"{'PID':>7} {'CPU':>5} {'MEM':>7} {'TIME':>6}  COMMAND")]
+        items = []
         total_cpu = total_mem = 0
 
         def walk(p, depth, parent_out):
@@ -972,8 +1181,11 @@ class ProcTab:
             rows.append(("cmd" if depth == 0 else "out",
                          f"{p['pid']:>7} {c:>4.0f}% {fmt_mem(p['rss']):>7} {ago(now - p['start']):>6}  "
                          f"{'  ' * depth}{via}{pretty_cmd(p['cmd'])}"))
-            if p["out"] != parent_out and deep:
-                rows.append(("dim", " " * 30 + "  " * depth + "↳ output: " + self.describe_out(p, procs, readers, tabs)))
+            out = self.describe_out(p, procs, readers, tabs) if deep and p["out"] != parent_out else None
+            if out:
+                rows.append(("dim", " " * 30 + "  " * depth + "↳ output: " + out))
+            items.append(dict(pid=p["pid"], cpu=round(c), mem=fmt_mem(p["rss"]), time=ago(now - p["start"]), depth=depth,
+                              cmd=pretty_cmd(p["cmd"]), via=bool(p.get("via")), out=out))
             for k in sorted(kids[p["pid"]], key=lambda q: q["start"]):
                 walk(k, depth + 1, p["out"])
 
@@ -982,7 +1194,8 @@ class ProcTab:
         if not aps:
             rows.append(("dim", "        (no processes running)"))
         self.prev = {k: v for k, v in self.prev.items() if k in byid}
-        self.rows, self.pids = rows, sorted(byid)
+        self.rows, self.pids, self.items = rows, sorted(byid), items
+        self.total_cpu, self.total_mem = total_cpu, total_mem
         self.label = f"Processes {len(aps)}" if aps else "Processes"
         cores = f" (≈{total_cpu / 100:.0f} cores)" if total_cpu >= 150 else ""
         self.summary = (f" {len(aps)} process{'es' if len(aps) != 1 else ''} · CPU {total_cpu:.0f}%{cores}"
@@ -1003,6 +1216,7 @@ class View:
         self.dismissed = {}      # path -> when the user closed it; stays closed until a new process writes there
         self.act_bottom, self.act_unread = None, 0
         self.expand = False
+        self.keep_subs = KEEP_DONE   # how long finished subagents keep their tab (the web page keeps them longer)
         self.show_sub = False    # subagent lines in Activity (they also have their own tabs)
         self.rows_cache, self.rows_key = [], None
 
@@ -1085,7 +1299,7 @@ class View:
             t = self.tabs.get(f)
             if t is None:
                 t = self.tabs[f] = LogTab(f, self.label_for(f, ps, task_of(ps, f)))
-            if not t.alive and not t.pinned:
+            if (not t.alive or t.label.startswith("task ")) and not t.pinned:   # a better name may be known now
                 t.label = self.label_for(f, ps, task_of(ps, f))
             t.alive, t.ended = True, None
             t.pids = sorted(p["pid"] for p in ps)
@@ -1112,7 +1326,7 @@ class View:
             alive = not sub["finished"] and now - updated < TOOL_STALE
             t = self.tabs.get(f)
             if t is None:
-                if f in self.dismissed or not (alive or now - updated < KEEP_DONE):
+                if f in self.dismissed or not (alive or now - updated < self.keep_subs):
                     continue
                 t = self.tabs[f] = SubTab(sub, self.feed, lambda: self.expand)
                 t.started = sub["started"]
@@ -1120,7 +1334,7 @@ class View:
             t.alive = alive
             t.ended = None if alive else (t.ended or updated)
         for f, t in list(self.tabs.items()):
-            if isinstance(t, SubTab) and not t.alive and f != self.sel and now - (t.ended or now) > KEEP_DONE:
+            if isinstance(t, SubTab) and not t.alive and f != self.sel and now - (t.ended or now) > self.keep_subs:
                 del self.tabs[f]
 
     def ordered(self):
@@ -1494,6 +1708,1595 @@ def tui(stdscr, args, agents, start):
                 t.unread = 0
 
 
+# ---------------------------------------------------------------- web page
+
+WEB_TEXT_LIMIT = 20000      # characters of one event sent to the page; longer outputs are cut
+WEB_FOCUS = 5               # seconds a tab counts as open after the page last asked for it
+
+
+def file_mtime(path):
+    """When the file was last saved, or None if it's gone."""
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+class WebState:
+    """Keeps a View per agent up to date in the background; the HTTP handlers read from it."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.agents = load_agents()
+        self.views = {a.id: View(a) for a in self.agents if a.supported}
+        for v in self.views.values():
+            v.keep_subs = BACKLOG_HOURS * 3600   # the page has room: keep the session's subagents listed
+            v.poll()                             # read the history first, so tabs get their proper names
+        self.focus = {}   # agent id -> (tab, time) the page last showed
+        self.history = {}  # (path, mtime, size, edits) -> file_history(), so it isn't redone on every request
+
+    def run(self):
+        while True:
+            try:
+                procs = scan_procs()
+                with self.lock:
+                    for aid, v in self.views.items():
+                        tab, when = self.focus.get(aid, (None, 0))
+                        v.sel = ProcTab.path if tab == "procs" and time.time() - when < WEB_FOCUS else None
+                        v.refresh(procs)
+                        v.poll()
+            except Exception as e:   # keep serving even if one scan fails
+                print(f"obwatch: scan failed: {e}", file=sys.stderr)
+            time.sleep(SCAN_EVERY)
+
+    # -- JSON for the page
+    @staticmethod
+    def event(e):
+        out = {k: e.get(k) for k in ("seq", "ts", "epoch", "kind", "desc", "bg", "name", "side", "src")}
+        if e.get("change"):
+            out["change"] = {k: v for k, v in e["change"].items() if k != "ops"}
+        text = e.get("text") or ""
+        out["text"] = text if len(text) <= WEB_TEXT_LIMIT else text[:WEB_TEXT_LIMIT] + f"\n… cut: {len(text) - WEB_TEXT_LIMIT} more characters"
+        return out
+
+    def summary(self, a):
+        now = time.time()
+        v = self.views.get(a.id)
+        d = dict(id=a.id, name=a.name, provider=a.provider, supported=a.supported)
+        if not v:
+            return d
+        age = now - a.last_write()
+        running = v.feed.running()
+        recent = [self.event(e) for e in sorted(v.feed.events, key=lambda e: e.get("epoch") or 0)
+                  if e["kind"] in ("cmd", "say", "think", "msg", "err") and not e.get("side") and e.get("text")][-4:]
+        for e in recent:
+            e["text"] = e["text"][:300]
+        d.update(state="working" if age < 20 or running else "idle", idle=age,
+                 now=running[-1][1] if running else None, now_s=now - running[-1][0] if running else 0,
+                 procs=len(v.ptab.pids), cpu=v.ptab.total_cpu, mem=fmt_mem(v.ptab.total_mem),
+                 running_tabs=v.running_count(), recent=recent)
+        return d
+
+    def tabs(self, v):
+        res = []
+        for t in v.ordered():
+            if t is v.ptab:
+                res.append(dict(key="procs", label="Processes", kind="procs", alive=True, count=len(t.pids)))
+            elif isinstance(t, SubTab):
+                res.append(dict(key="sub:" + t.path, label=t.label, kind="sub", alive=t.alive, agent_kind=t.kind,
+                                started=t.started, ended=t.ended))
+            else:
+                res.append(dict(key="log:" + t.path, label=t.label, kind="pinned" if t.pinned else "log", alive=t.alive,
+                                path=t.path, pids=t.pids, started=t.started, ended=t.ended))
+        return res
+
+    def agent(self, aid, since, tab):
+        with self.lock:
+            v = self.views.get(aid)
+            if not v:
+                return None
+            self.focus[aid] = (tab, time.time())
+            first = v.feed.events[0]["seq"] if v.feed.events else 0
+            events = [self.event(e) for e in v.feed.events if e["seq"] > since]
+            files = {e["change"]["file"] for e in v.feed.events if e.get("change")} if tab == "changes" else ()
+            return dict(agent=self.summary(v.agent), events=events, reset=since >= 0 and since + 1 < first,
+                        tabs=self.tabs(v), files={f: file_mtime(f) for f in files},
+                        procs=dict(summary=v.ptab.summary.strip(), items=v.ptab.items, hint=PROC_HINT))
+
+    def agents_json(self):
+        with self.lock:
+            return dict(agents=[self.summary(a) for a in self.agents])
+
+    def changes(self, aid):
+        with self.lock:
+            v = self.views.get(aid)
+            if not v:
+                return None
+            return dict(changes=[dict(self.event(e), text="") for e in v.feed.events if e.get("change")])
+
+    def file(self, aid, path):
+        """The current text of a Markdown file the agent changed (for the rendered view), with when each line
+        got its text (see file_history). Nothing else is readable."""
+        with self.lock:
+            v = self.views.get(aid)
+            evs = sorted((e for e in v.feed.events if e.get("change") and e["change"]["file"] == path) if v else [],
+                         key=lambda e: (e.get("epoch") or 0, e["seq"]))
+            steps = [dict(ops=e["change"].get("ops") or [], epoch=e.get("epoch"), ts=e["ts"], seq=e["seq"],
+                          side=bool(e.get("side")), write=e["change"].get("op") == "write")
+                     for e in evs if not e["change"].get("failed")]
+        if not evs or not path.lower().endswith((".md", ".markdown")):
+            return None
+        try:
+            if not os.path.isfile(path) or os.path.getsize(path) > 2 << 20:
+                return dict(path=path, missing=True)
+            text = read(path, "rb").decode("utf-8", "replace")
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return dict(path=path, missing=True)
+        base = git_base(path)
+        key = (path, mtime, len(text), tuple(s["seq"] for s in steps), base and base["head"])
+        hit = self.history.get(key)
+        if hit is None:
+            clean = text.replace("\r", "")
+            hist, extra = file_history(clean, steps), []
+            if base:
+                hist, extra = mark_uncommitted(clean, hist, steps, base, mtime)
+            hit = (hist, extra, base and unified(base["text"] or "", clean, path, 2000))
+            self.history = {key: hit} if len(self.history) > 50 else {**self.history, key: hit}
+        hist, extra, gitdiff = hit
+        out = [{k: s[k] for k in ("epoch", "ts", "seq", "side", "write")} for s in steps] + extra
+        return dict(path=path, text=text, mtime=mtime, history=hist, steps=out, gitdiff=gitdiff,
+                    git=base and dict(head=base["head"], time=base["time"], tracked=base["text"] is not None))
+
+    def log(self, aid, key, since):
+        with self.lock:
+            v = self.views.get(aid)
+            t = v and v.tabs.get(key)
+            if not isinstance(t, LogTab):
+                return None
+            rows = list(t.rows)
+            first = t.count - len(rows)
+            start = max(since + 1, first)
+            return dict(lines=rows[start - first:], last=t.count - 1, partial=ANSI.sub("", t.part),
+                        alive=t.alive, path=t.path, reset=since >= 0 and since + 1 < first)
+
+
+# ------------------------------------------------------------ terminal pane (btop in the page)
+# The page draws the terminal with xterm.js, the terminal emulator VS Code uses. obwatch stays one file:
+# the first time the pane opens, it downloads these exact package versions from the npm registry, checks
+# them against the hashes below, and keeps them in ~/.cache/obwatch. The browser loads them from obwatch,
+# never from the internet.
+XTERM = [   # (package, version, sha512 of the .tgz as npm publishes it, files to keep)
+    ("@xterm/xterm", "6.0.0", "TQwDdQGtwwDt+2cgKDLn0IRaSxYu1tSUjgKarSDkUM0ZNiSRXFpjxEsvc/Zgc5kq5omJ+V0a8/kIM2WD3sMOYg==",
+     ("lib/xterm.js", "css/xterm.css")),
+    ("@xterm/addon-fit", "0.11.0", "jYcgT6xtVYhnhgxh3QgYDnnNMYTcf8ElbxxFzX0IZo+vabQqSPAjC3c1wJrKB5E19VwQei89QCiZZP86DCPF7g==",
+     ("lib/addon-fit.js",)),
+    ("@xterm/addon-webgl", "0.19.0", "b3fMOsyLVuCeNJWxolACEUED0vm7qC0cy4wRvf3oURSzDTYVQiGPhTnhWZwIHdvC48Y+oLhvYXnY4XDXPoJo6A==",
+     ("lib/addon-webgl.js",)),
+    ("@xterm/addon-unicode11", "0.9.0", "FxDnYcyuXhNl+XSqGZL/t0U9eiNb/q3EWT5rYkQT/zuig8Gz/VagnQANKHdDWFM2lTMk9ly0EFQxxxtZUoRetw==",
+     ("lib/addon-unicode11.js",)),
+]
+XTERM_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "obwatch", "xterm-6.0.0")
+XTERM_FILES = {os.path.basename(f): f for _, _, _, files in XTERM for f in files}
+TERM_CMD = ["btop"]
+TERM_MAX = 4              # terminals open at once
+_xterm_lock = threading.Lock()
+_terms = set()            # pids of running terminal programs, stopped when obwatch exits
+
+
+def xterm_assets():
+    """The folder with the xterm.js files, downloading and checking them the first time."""
+    import base64, hashlib, io, tarfile, urllib.request
+    with _xterm_lock:
+        if all(os.path.isfile(os.path.join(XTERM_DIR, f)) for f in XTERM_FILES):
+            return XTERM_DIR
+        os.makedirs(XTERM_DIR, exist_ok=True)
+        for pkg, ver, sha, files in XTERM:
+            url = f"https://registry.npmjs.org/{pkg}/-/{pkg.split('/')[1]}-{ver}.tgz"
+            with urllib.request.urlopen(url, timeout=60) as r:
+                data = r.read(20 << 20)
+            if base64.b64encode(hashlib.sha512(data).digest()).decode() != sha:
+                raise RuntimeError(f"{pkg} {ver} from the npm registry doesn't match its known hash; not using it")
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as t:
+                for f in files:
+                    body = t.extractfile("package/" + f).read()
+                    tmp = os.path.join(XTERM_DIR, os.path.basename(f) + ".part")
+                    with open(tmp, "wb") as out:
+                        out.write(body)
+                    os.replace(tmp, os.path.join(XTERM_DIR, os.path.basename(f)))
+        return XTERM_DIR
+
+
+def ws_accept(key):
+    import base64, hashlib
+    return base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+
+
+def ws_frame(data, opcode=2):
+    n = len(data)
+    head = bytes([0x80 | opcode]) + (bytes([n]) if n < 126 else struct.pack("!BH", 126, n) if n < 65536 else struct.pack("!BQ", 127, n))
+    return head + data
+
+
+def ws_read(sock):
+    """One WebSocket message from the browser: (opcode, payload). Raises EOFError when the connection ends."""
+    def exact(n):
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise EOFError
+            buf += chunk
+        return buf
+    msg, first = b"", None
+    while True:
+        b0, b1 = exact(2)
+        n = b1 & 0x7f
+        if n == 126:
+            n = struct.unpack("!H", exact(2))[0]
+        elif n == 127:
+            n = struct.unpack("!Q", exact(8))[0]
+        if n > 1 << 20:
+            raise EOFError
+        mask = exact(4) if b1 & 0x80 else b"\0\0\0\0"
+        data = bytes(c ^ mask[i % 4] for i, c in enumerate(exact(n)))
+        op = b0 & 0x0f
+        if op >= 8:                      # control frames may arrive between the parts of a message
+            return op, data
+        first = op if first is None else first
+        msg += data
+        if b0 & 0x80:
+            return first, msg
+
+
+def term_size(fd, cols, rows):
+    import fcntl, termios
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", max(2, min(rows, 500)), max(2, min(cols, 1000)), 0, 0))
+
+
+def stop_term(pid):
+    """Stop a terminal program: politely, then for sure. Safe to call twice (two threads may)."""
+    import signal
+    try:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            os.kill(pid, sig)
+            end = time.time() + 1
+            while time.time() < end:
+                if os.waitpid(pid, os.WNOHANG)[0]:
+                    return
+                time.sleep(0.05)
+    except (ProcessLookupError, ChildProcessError):   # already gone or already collected
+        pass
+    finally:
+        _terms.discard(pid)
+
+
+def run_term(sock, cols, rows):
+    """Run btop on a pseudo-terminal and connect it to the browser's WebSocket until either side ends.
+    Browser -> btop: binary messages are keystrokes and mouse input, text messages {"resize": [cols, rows]}."""
+    import pty, select
+    env = dict(os.environ, TERM="xterm-256color", COLORTERM="truecolor")
+    if "UTF-8" not in (env.get("LC_ALL") or env.get("LC_CTYPE") or env.get("LANG") or "").upper().replace("UTF8", "UTF-8"):
+        env["LANG"] = "C.UTF-8"
+    pid, fd = pty.fork()
+    if pid == 0:   # the child: becomes btop
+        try:
+            os.execvpe(TERM_CMD[0], TERM_CMD, env)
+        finally:
+            os._exit(127)
+    _terms.add(pid)
+    try:
+        term_size(fd, cols, rows)
+        while True:
+            ready = select.select([sock, fd], [], [], 30)[0]
+            if fd in ready:
+                try:
+                    out = os.read(fd, 1 << 16)
+                except OSError:
+                    out = b""
+                if not out:   # btop quit
+                    sock.sendall(ws_frame(struct.pack("!H", 1000) + b"btop exited", 8))
+                    break
+                sock.sendall(ws_frame(out))
+            if sock in ready:
+                op, data = ws_read(sock)
+                if op == 8:
+                    sock.sendall(ws_frame(data[:2], 8))
+                    break
+                if op == 9:
+                    sock.sendall(ws_frame(data, 10))
+                elif op == 2:
+                    os.write(fd, data)
+                elif op == 1:
+                    try:
+                        c, r = json.loads(data.decode())["resize"]
+                        term_size(fd, int(c), int(r))
+                    except (ValueError, KeyError, TypeError):
+                        pass
+    except (EOFError, OSError):
+        pass
+    finally:
+        stop_term(pid)
+        os.close(fd)
+
+
+def lan_address():
+    """(this machine's address, its local network) on the interface of the default route, e.g.
+    (192.0.2.50, 192.0.2.0/24). Read from /proc/net/route, so no extra tools are needed."""
+    rows = [line.split() for line in read("/proc/net/route").splitlines()[1:]]
+    hexip = lambda h: ipaddress.IPv4Address(struct.pack("<I", int(h, 16)))
+    default = [r for r in rows if r[1] == "00000000" and int(r[3], 16) & 2]   # destination 0.0.0.0, gateway flag
+    if not default:
+        raise SystemExit("obwatch: no default route, so no local network to listen on.")
+    iface, gateway = default[0][0], hexip(default[0][2])
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:   # no packet is sent: this only picks the source address
+        s.connect((str(gateway), 9))
+        me = ipaddress.IPv4Address(s.getsockname()[0])
+    for r in rows:
+        if r[0] == iface and r[1] != "00000000":
+            net = ipaddress.IPv4Network(f"{hexip(r[1])}/{hexip(r[7])}")
+            if me in net:
+                if not net.is_private:
+                    raise SystemExit(f"obwatch: {net} on {iface} isn't a private network; refusing to listen there.")
+                return me, net
+    raise SystemExit(f"obwatch: couldn't find the local network of {iface}.")
+
+
+def client_allowed(ip, network):
+    """This machine always; otherwise only addresses inside the local network that --lan listens on."""
+    client = ipaddress.ip_address(ip)
+    return client.is_loopback or (network is not None and client in network)
+
+
+class AccessLog:
+    """Prints every connection attempt to the terminal. Refused requests and page loads are always shown;
+    the page's live updates (a few a second) are summarized per browser once a minute."""
+
+    def __init__(self, out=None):
+        self.out = out or sys.stdout
+        self.lock = threading.Lock()
+        self.clients = set()
+        self.ok = collections.Counter()
+        self.flushed = time.time()
+
+    def line(self, text):
+        print(f"{time.strftime('%H:%M:%S')}  {text}", file=self.out, flush=True)
+
+    def request(self, client, line, code, reason=""):
+        with self.lock:
+            if client not in self.clients:
+                self.clients.add(client)
+                self.line(f"{client:<15}  new client")
+            path = line.split(" ")[1] if line.count(" ") >= 1 else line
+            if code == 200 and path.startswith("/api/"):
+                self.ok[client] += 1
+            else:
+                self.line(f"{client:<15}  {line or '(no request line)'}  → {code}{'  ' + reason if reason else ''}")
+            if time.time() - self.flushed >= 60:
+                for c, n in sorted(self.ok.items()):
+                    self.line(f"{c:<15}  {n} live updates OK in the last minute")
+                self.ok.clear()
+                self.flushed = time.time()
+
+
+def web_handler(state, token, port, address=None, network=None, log=None):
+    from http.server import BaseHTTPRequestHandler
+    from urllib.parse import parse_qs, urlparse
+    hosts = {f"localhost:{port}", f"127.0.0.1:{port}", f"[::1]:{port}"}
+    if address:
+        hosts.add(f"{address}:{port}")
+
+    log = log or AccessLog(open(os.devnull, "w"))
+    cookie = f"obwatch_{port}"
+
+    class Handler(BaseHTTPRequestHandler):
+        reason = ""
+
+        def log_message(self, *a):
+            pass
+
+        def log_request(self, code="-", size="-"):   # called for every response, including errors from http.server
+            code = int(getattr(code, "value", code)) if str(getattr(code, "value", code)).isdigit() else 0
+            line = self.requestline if self.requestline.isprintable() else repr(self.requestline)[:80]
+            line = re.sub(r"token=[^&\s]+", "token=***", line)   # never print the token
+            reason = self.reason
+            if code == 400 and not self.requestline.startswith(("GET", "POST", "HEAD", "PUT", "DELETE", "OPTIONS")):
+                reason = reason or "not an HTTP request: did the browser use https://? The link is http://"
+            log.request(self.client_address[0], line, code, reason)
+
+        def authorized(self):
+            cookies = dict(c.strip().split("=", 1) for c in self.headers.get("Cookie", "").split(";") if "=" in c)
+            given = self.headers.get("X-Obwatch-Token") or cookies.get(cookie, "")
+            return hmac.compare_digest(given, token)
+
+        def send(self, code, body, ctype="application/json", headers=(), cache="no-store"):
+            data = body if isinstance(body, bytes) else json.dumps(body, default=str).encode()
+            if code != 200 and isinstance(body, dict):
+                self.reason = body.get("error", "")
+            self.send_response(code)
+            for k, v in headers:
+                self.send_header(k, v)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", cache)
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def refused(self):
+            """The checks every request passes first. Returns True after sending a refusal."""
+            if not client_allowed(self.client_address[0], network):
+                self.send(403, {"error": "only devices on the local network may connect"})
+            elif self.headers.get("Host") not in hosts:   # blocks DNS-rebinding tricks from other web pages
+                self.send(403, {"error": "wrong host"})
+            else:
+                return False
+            return True
+
+        def do_GET(self):
+            if self.refused():
+                return
+            url = urlparse(self.path)
+            q = {k: v[0] for k, v in parse_qs(url.query).items()}
+            if url.path == "/":
+                if "token" in q:   # the printed link: keep the token in a cookie, then drop it from the address bar
+                    if not hmac.compare_digest(q["token"], token):
+                        self.reason = "wrong token in the link (obwatch makes a new one each time it starts)"
+                        return self.send(200, WEB_PAGE.encode(), "text/html; charset=utf-8")
+                    return self.send(303, b"", "text/plain", [
+                        ("Location", "/"),
+                        ("Set-Cookie", f"{cookie}={token}; Path=/; HttpOnly; SameSite=Strict")])
+                return self.send(200, WEB_PAGE.encode(), "text/html; charset=utf-8")
+            if not self.authorized():
+                return self.send(403, {"error": "missing or wrong token: open the link obwatch printed"})
+            try:
+                since = int(q.get("since", "-1"))
+            except ValueError:
+                since = -1
+            if url.path == "/api/agents":
+                return self.send(200, state.agents_json())
+            if url.path.startswith("/assets/"):
+                return self.asset(url.path[8:])
+            if url.path == "/term":
+                return self.terminal(q)
+            if url.path == "/api/agent":
+                d = state.agent(q.get("id", ""), since, q.get("tab", ""))
+            elif url.path == "/api/changes":
+                d = state.changes(q.get("id", ""))
+            elif url.path == "/api/log":
+                d = state.log(q.get("id", ""), q.get("key", ""), since)
+            elif url.path == "/api/file":
+                d = state.file(q.get("id", ""), q.get("path", ""))
+            else:
+                d = None
+            return self.send(200, d) if d is not None else self.send(404, {"error": "not found"})
+
+        def asset(self, name):
+            if name not in XTERM_FILES:
+                return self.send(404, {"error": "not found"})
+            try:
+                folder = xterm_assets()
+            except Exception as e:
+                return self.send(502, {"error": f"couldn't get the terminal library (xterm.js): {e}"})
+            ctype = "text/css" if name.endswith(".css") else "text/javascript"
+            return self.send(200, read(os.path.join(folder, name), "rb"), ctype + "; charset=utf-8", cache="private, max-age=86400")
+
+        def terminal(self, q):
+            """The btop pane: a WebSocket to a pseudo-terminal running btop."""
+            origin, host = self.headers.get("Origin", ""), self.headers.get("Host", "")
+            if origin != f"http://{host}":   # only this page may open it, not a script on another site
+                return self.send(403, {"error": f"terminal: wrong origin {origin!r}"})
+            key = self.headers.get("Sec-WebSocket-Key")
+            if self.headers.get("Upgrade", "").lower() != "websocket" or not key:
+                return self.send(400, {"error": "terminal: not a WebSocket request"})
+            if len(_terms) >= TERM_MAX:
+                return self.send(429, {"error": f"terminal: {TERM_MAX} already open"})
+            import shutil
+            if not shutil.which(TERM_CMD[0]):
+                return self.send(404, {"error": f"terminal: {TERM_CMD[0]} isn't installed on this machine"})
+            try:
+                cols, rows = int(q.get("cols", 120)), int(q.get("rows", 30))
+            except ValueError:
+                cols, rows = 120, 30
+            self.send_response(101)
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Sec-WebSocket-Accept", ws_accept(key))
+            self.end_headers()
+            self.wfile.flush()
+            self.close_connection = True
+            log.line(f"{self.client_address[0]:<15}  terminal opened: {' '.join(TERM_CMD)} ({cols}x{rows})")
+            started = time.time()
+            run_term(self.connection, cols, rows)
+            log.line(f"{self.client_address[0]:<15}  terminal closed after {ago(time.time() - started)}")
+
+    return Handler
+
+
+def web(port, lan=False):
+    from http.server import ThreadingHTTPServer
+    address, network = lan_address() if lan else (None, None)
+    state = WebState()
+    token = secrets.token_urlsafe(18)
+    threading.Thread(target=state.run, daemon=True).start()
+    server = ThreadingHTTPServer((str(address) if lan else "127.0.0.1", port),
+                                 web_handler(state, token, port, address, network, AccessLog()))
+    if lan:
+        print(f"obwatch web is running on your local network only: {address}:{port}, open to devices in {network}.\n"
+              f"It doesn't listen on other interfaces (VPN, Docker), and refuses clients outside {network}.\n\n"
+              f"  Open:  http://{address}:{port}/?token={token}\n\n"
+              f"Plain HTTP: anyone on this network who can watch its traffic could see the token.\n"
+              f"If the page keeps loading on another device, a firewall here is probably dropping port {port}, e.g. for ufw:\n"
+              f"  sudo ufw allow from {network} to {address} port {port} proto tcp\n"
+              f"The link contains a secret token; don't share it. Ctrl-C stops the server.\n\n"
+              f"Connection attempts:", flush=True)
+    else:
+        print(f"obwatch web is running on this machine only (127.0.0.1:{port}).\n\n"
+              f"  Open:  http://localhost:{port}/?token={token}\n\n"
+              f"From your own computer, forward the port over SSH first:\n"
+              f"  ssh -L {port}:localhost:{port} <this server>\n"
+              f"Or run `obwatch --web --lan` to open it to your local network instead.\n"
+              f"The link contains a secret token; don't share it. Ctrl-C stops the server.\n\n"
+              f"Connection attempts:", flush=True)
+    import signal
+    def bye(*_):   # closing the terminal or `kill` ends obwatch the same way as Ctrl-C
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, bye)
+    signal.signal(signal.SIGHUP, bye)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print()
+    finally:
+        for pid in list(_terms):   # don't leave a btop running after obwatch stops
+            stop_term(pid)
+
+
+
+WEB_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>obwatch</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#1e2127;--panel:#262a31;--nav:#21252b;--fg:#c8ccd4;--dim:#7f848e;--line:#333842;--cyan:#56b6c2;--mag:#c678dd;--yel:#e5c07b;--grn:#98c379;--red:#e06c75;--blu:#61afef;--navw:270px;--th:340px}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;display:flex;flex-direction:column;background:var(--bg);color:var(--fg);font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,"DejaVu Sans Mono",monospace}
+header{flex:none;display:flex;gap:12px;align-items:center;height:40px;padding:0 14px;background:var(--panel);border-bottom:1px solid var(--line)}
+header a{color:var(--fg);text-decoration:none;font-weight:bold}
+#crumb{color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#status{margin-left:auto;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hbtn{background:none;border:1px solid var(--line);color:var(--dim);border-radius:4px;padding:2px 8px;cursor:pointer;font:inherit}
+.hbtn:hover,.hbtn.on{color:var(--fg);border-color:var(--cyan)}
+#app{flex:1;min-height:0;overflow:auto}
+/* overview */
+.sect{padding:10px 14px 0;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:12px;padding:8px 14px 6px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px;cursor:pointer;min-width:0}
+.card:hover,.card.sel{border-color:var(--cyan)}
+.card.sel{box-shadow:0 0 0 1px var(--cyan)}
+.card.work{border-left:4px solid var(--grn);background:#26302a}
+.card.work h3::after{content:" ● working";color:var(--grn);font-size:12px;animation:pulse 1.6s infinite}
+@keyframes pulse{50%{opacity:.35}}
+.card.off{opacity:.45;cursor:default}
+.card h3{margin:0 0 4px;font-size:14px}
+.card .line{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.badge{display:inline-block;padding:0 6px;border-radius:4px;background:var(--line);color:var(--dim);font-size:11px;margin-right:6px}
+/* agent page */
+.layout{display:flex;height:100%}
+nav{width:var(--navw);flex:none;border-right:1px solid var(--line);overflow:auto;padding:6px 0;background:var(--nav)}
+nav.hidden{display:none}
+nav .grp{padding:10px 12px 3px;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.05em}
+nav .tab{padding:4px 12px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border-left:3px solid transparent}
+nav .tab:hover{background:#2a2e36}
+nav .tab.sel{background:#2c313a;border-left-color:var(--cyan)}
+main{flex:1;display:flex;flex-direction:column;min-width:0}
+.toolbar{display:flex;gap:12px;flex-wrap:wrap;align-items:center;padding:6px 12px;border-bottom:1px solid var(--line);background:var(--panel);color:var(--dim)}
+.toolbar label{cursor:pointer;user-select:none}
+.toolbar input[type=search]{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:3px 6px;width:220px;font:inherit}
+.toolbar .info{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#pane{flex:1;overflow:auto;padding:4px 12px 60px}
+.ev{display:grid;grid-template-columns:66px 58px minmax(0,1fr);gap:8px;padding:2px 0;border-bottom:1px solid #23272e}
+.ev .t{color:var(--dim)}
+.ev .k{font-weight:bold}
+pre{margin:0;white-space:pre-wrap;word-break:break-word;font:inherit}
+.c-cmd{color:var(--yel)} .c-say{color:var(--cyan)} .c-think{color:var(--mag)} .c-msg{color:var(--grn)}
+.c-tool{color:var(--blu)} .c-err{color:var(--red)} .c-out{color:var(--dim)} .c-dim{color:var(--dim)}
+.b-cmd{color:var(--yel);font-weight:bold} .b-out{color:var(--fg)}
+details>summary{cursor:pointer;color:var(--dim);list-style:none}
+details>summary::-webkit-details-marker{display:none}
+details>summary::before{content:"▸ "} details[open]>summary::before{content:"▾ "}
+.live{color:var(--grn)} .done{color:var(--dim)}
+.notice{color:var(--yel);border-color:var(--yel)} .hidden{display:none}
+.empty{color:var(--dim);padding:20px 0}
+table{border-collapse:collapse}
+td,th{padding:2px 8px;text-align:left;border-bottom:1px solid #23272e;vertical-align:top}
+.procs{width:100%} .procs th{color:var(--dim);font-weight:normal;position:sticky;top:0;background:var(--bg)}
+td.n{text-align:right;white-space:nowrap}
+.log .e{color:var(--red)} .log .w{color:var(--yel)}
+/* changes */
+.fgroup{border:1px solid var(--line);border-radius:6px;margin:8px 0;background:#21252b}
+.fgroup>summary{padding:6px 10px;color:var(--fg)}
+.fgroup>summary .meta{color:var(--dim)}
+.fgroup>summary .add{color:var(--grn)} .fgroup>summary .del{color:var(--red)}
+.fgroup.mdfile>summary{border-left:3px solid var(--blu)}
+.fbody{padding:0 10px 10px}
+.edit{margin-top:10px}
+.edit .hd{color:var(--dim);padding:2px 0}
+.modes{margin:6px 0}
+.sbs{width:100%;table-layout:fixed;font-size:12px;border:1px solid var(--line)}
+.sbs col.ln{width:46px}
+.sbs td{border:none;padding:0 6px;white-space:pre-wrap;word-break:break-word}
+.sbs td.ln{color:#5c6370;text-align:right;user-select:none;background:#1b1e23}
+.sbs td.del{background:#3a2226} .sbs td.add{background:#223524} .sbs td.none{background:#1b1e23}
+.sbs tr.hunk td{color:var(--cyan);background:#1f2a30}
+.sbs tr.info td{color:var(--dim)}
+.md{background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:4px 18px;font:14px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif;max-width:980px}
+.md h1,.md h2{border-bottom:1px solid var(--line);padding-bottom:4px}
+.md code{background:#2c313a;border-radius:3px;padding:0 4px;font:12px ui-monospace,Menlo,monospace}
+.md pre.code{background:#2c313a;border-radius:6px;padding:8px 10px;font:12px/1.45 ui-monospace,Menlo,monospace;overflow:auto;white-space:pre}
+.md blockquote{border-left:3px solid var(--line);margin:0;padding:0 12px;color:var(--dim)}
+.md table td,.md table th{border:1px solid var(--line);padding:3px 8px}
+.md a{color:var(--blu)}
+.md .mdimg{color:var(--dim);border:1px dashed var(--line);border-radius:4px;padding:0 6px;font-size:12px}
+.md hr{border:none;border-top:1px solid var(--line)}
+/* Markdown with edits marked */
+.md{--hla:rgba(152,195,121,.12);--hlm:rgba(229,192,123,.12)}
+.md .ml.hl{position:relative;background:var(--hla);border-left:3px solid var(--grn);padding-left:8px;margin-left:-11px;border-radius:0 3px 3px 0}
+.md .ml.hl-mod{background:var(--hlm);border-left-color:var(--yel)}
+.md .ml.hl-new{--hla:rgba(152,195,121,.24);--hlm:rgba(229,192,123,.24)}
+.md li.ml.hl{border-left:none;padding-left:0;margin-left:0} .md li.hl::marker{color:var(--grn)} .md li.hl-mod::marker{color:var(--yel)}
+.md tr.ml.hl{border:none;padding:0;margin:0;background:none} .md tr.hl>td,.md tr.hl>th{background:var(--hla)} .md tr.hl-mod>td,.md tr.hl-mod>th{background:var(--hlm)}
+.md tr.hl>:first-child{box-shadow:inset 3px 0 0 var(--grn)} .md tr.hl-mod>:first-child{box-shadow:inset 3px 0 0 var(--yel)}
+.md span.cl.hl{display:inline-block;width:100%;min-height:1.2em;vertical-align:top;margin-left:0;padding-left:0;border-left:none}
+.md .when{float:right;margin-left:10px;font:11px ui-monospace,Menlo,monospace;color:var(--grn);opacity:.85;user-select:none}
+.md .hl-mod .when{color:var(--yel)}
+.md li>.when{float:none;position:absolute;right:4px;top:2px}
+.md td>.when{float:none;margin:0 0 0 10px}
+.md details.removed,.md details.before{font:12px ui-monospace,Menlo,monospace;margin:4px 0}
+.md details.removed>summary{color:var(--red)} .md details.before>summary{color:var(--yel);display:inline}
+.md details.removed pre{color:#c98088;text-decoration:line-through;background:#2a1f22;padding:4px 8px;border-left:3px solid var(--red);white-space:pre-wrap}
+.md .wdiff{white-space:pre-wrap;background:#262420;padding:4px 8px;border-left:3px solid var(--yel);font:13px/1.5 system-ui,sans-serif}
+.md .wdiff del{color:#e8a0a8;background:#4a2229} .md .wdiff ins{color:#c4e6a8;background:#26432a;text-decoration:none}
+.md .fold{display:none} .md .ctx{opacity:.55}
+.md .gap{color:var(--dim);font:12px ui-monospace,Menlo,monospace;cursor:pointer;padding:2px 0;border-top:1px dashed var(--line);border-bottom:1px dashed var(--line);margin:6px 0;text-align:center}
+.md .gap:hover,.md .gapli:hover{color:var(--fg)}
+.md .gapli{color:var(--dim);cursor:pointer;list-style:none;font:12px ui-monospace,Menlo,monospace}
+.mdinfo{color:var(--dim);font-size:12px;margin:4px 0 8px;max-width:980px}
+.since{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:4px;font:inherit;padding:1px 4px}
+.lg-add{color:var(--grn)} .lg-mod{color:var(--yel)} .lg-del{color:var(--red)} .legend{margin-left:6px}
+.edit.failed{opacity:.5}
+.fgroup.gone>summary{color:var(--dim)} .fgroup.gone .fname{text-decoration:line-through}
+/* terminal pane (btop) */
+#tpane{flex:none;display:flex;flex-direction:column;border-top:1px solid var(--line);background:#16181d;min-height:0}
+#tpane.hidden{display:none}
+#tgrip{height:6px;cursor:ns-resize;background:var(--panel);border-bottom:1px solid var(--line)}
+#tgrip:hover,#tgrip.drag{background:var(--cyan)}
+#tbar{display:flex;gap:6px;align-items:center;padding:3px 10px;background:var(--panel);color:var(--dim);font-size:12px}
+#tbar b{color:var(--fg)} #tbar .sp{flex:1}
+#tbar .hbtn{padding:0 7px;font-size:12px}
+#tbar .kb{color:var(--dim)} #tbar .kb.on{color:var(--grn)}
+#tbox{flex:1;min-height:0;padding:2px 0 0 4px;overflow:hidden}
+#tbox .msg{color:var(--dim);padding:10px}
+#tbtn.on{color:var(--grn);border-color:var(--grn)}
+/* help */
+#help{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:10}
+#help.hidden{display:none}
+#help .box{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px 22px;max-height:90vh;overflow:auto;min-width:520px}
+#help h4{margin:10px 0 4px;color:var(--cyan)}
+#help td{border:none;padding:1px 10px 1px 0}
+#help kbd{background:var(--bg);border:1px solid var(--line);border-radius:3px;padding:0 5px}
+</style></head><body>
+<header><a href="#/">obwatch</a><span id="crumb"></span><span id="status"></span>
+<button class="hbtn" id="tbtn" title="system monitor at the bottom (t)">▤ btop</button>
+<button class="hbtn" id="helpbtn" title="keyboard shortcuts (?)">?</button></header>
+<div id="app"></div>
+<div id="tpane" class="hidden"><div id="tgrip" title="drag to resize"></div>
+<div id="tbar"><b>btop</b><span class="kb" id="tkb">click it (or press T) to type into btop · Ctrl+] gives the keys back</span><span class="sp"></span>
+<span id="tsmall" class="hidden c-err" title="btop needs at least 80 columns and 24 rows">too small for btop: taller (+) or smaller font (Alt −)</span>
+<span>size</span><button class="hbtn" data-h="25">S</button><button class="hbtn" data-h="40">M</button><button class="hbtn" data-h="60">L</button><button class="hbtn" data-h="85">XL</button>
+<span>font</span><button class="hbtn" id="tfm">−</button><span id="tfs"></span><button class="hbtn" id="tfp">+</button>
+<button class="hbtn" id="tclose" title="close (t); stops btop">✕</button></div>
+<div id="tbox"></div></div>
+<div id="help" class="hidden"><div class="box"><b>Keyboard</b>
+<h4>Anywhere</h4><table>
+<tr><td><kbd>?</kbd></td><td>this help</td></tr>
+<tr><td><kbd>\</kbd></td><td>show / hide the tab list</td></tr>
+<tr><td><kbd>&lt;</kbd> <kbd>&gt;</kbd></td><td>narrower / wider tab list</td></tr>
+<tr><td><kbd>Esc</kbd> <kbd>h</kbd></td><td>back to all agents</td></tr></table>
+<h4>btop pane</h4><table>
+<tr><td><kbd>t</kbd></td><td>open / close it (btop runs only while it's open)</td></tr>
+<tr><td><kbd>T</kbd></td><td>type into btop; <kbd>Ctrl</kbd>+<kbd>]</kbd> gives the keys back to the page</td></tr>
+<tr><td><kbd>+</kbd> <kbd>-</kbd></td><td>taller / shorter (or drag its top edge; S M L XL)</td></tr>
+<tr><td><kbd>Alt</kbd>+<kbd>+</kbd> <kbd>Alt</kbd>+<kbd>-</kbd></td><td>bigger / smaller font, so all CPU cores fit</td></tr></table>
+<h4>All agents</h4><table>
+<tr><td><kbd>j</kbd> <kbd>k</kbd> / arrows</td><td>select an agent</td></tr>
+<tr><td><kbd>Enter</kbd> or <kbd>1</kbd>–<kbd>9</kbd></td><td>open it</td></tr></table>
+<h4>One agent</h4><table>
+<tr><td><kbd>[</kbd> <kbd>]</kbd></td><td>previous / next tab</td></tr>
+<tr><td><kbd>a</kbd> <kbd>c</kbd> <kbd>p</kbd></td><td>Activity / Changes / Processes</td></tr>
+<tr><td><kbd>j</kbd> <kbd>k</kbd>, <kbd>Space</kbd> <kbd>Shift</kbd>+<kbd>Space</kbd></td><td>scroll a little / a page</td></tr>
+<tr><td><kbd>g</kbd> <kbd>G</kbd></td><td>top / bottom (and follow new lines)</td></tr>
+<tr><td><kbd>f</kbd></td><td>follow new lines on / off</td></tr>
+<tr><td><kbd>/</kbd></td><td>search Activity</td></tr>
+<tr><td><kbd>s</kbd></td><td>show / hide subagent lines in Activity</td></tr>
+<tr><td><kbd>e</kbd></td><td>expand / collapse everything on the page</td></tr>
+<tr><td><kbd>r</kbd></td><td>Changes: show new changes (the page stays still while you scroll)</td></tr>
+<tr><td><kbd>m</kbd></td><td>Changes: Markdown as whole file / changes only / diffs</td></tr>
+<tr><td><kbd>H</kbd></td><td>Changes: which edits to highlight (after the file was written / everything / last hour / last 10 min / latest)</td></tr></table>
+<p class="c-dim">Esc or ? closes this.</p></div></div>
+<script>
+"use strict";
+// ------------------------------------------------------------ basics
+// Opening the printed link (/?token=...) stores the token in a cookie, so every page and tab works until
+// obwatch restarts. Older links put it after # instead; those still work for this tab.
+let TOKEN = sessionStorage.obwToken || "";
+function takeToken() {
+  const m = location.hash.match(/token=([\w-]+)/);
+  if (m) { TOKEN = sessionStorage.obwToken = m[1]; history.replaceState(null, "", "#/"); }
+}
+const $ = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+const ago = s => { s = Math.max(0, Math.floor(s)); if (s < 60) return s + "s"; if (s < 3600) return Math.floor(s / 60) + "m";
+  if (s < 86400) return Math.floor(s / 3600) + "h" + String(Math.floor(s % 3600 / 60)).padStart(2, "0") + "m"; return Math.floor(s / 86400) + "d"; };
+const TAG = {msg: "IN", say: "SAY", think: "THINK", cmd: "$", tool: "TOOL", out: "│", err: "ERR"};
+const KINDS = [["cmd", "Commands"], ["out", "Output"], ["think", "Reasoning"], ["say", "Messages"], ["msg", "Incoming"], ["tool", "Other tools"], ["err", "Errors"]];
+const status = (t, bad) => { const s = document.getElementById("status"); s.textContent = t; s.style.color = bad ? "var(--red)" : ""; };
+const headers = extra => Object.assign(TOKEN ? {"X-Obwatch-Token": TOKEN} : {}, extra || {});
+async function api(path) {
+  const r = await fetch(path, {headers: headers(), credentials: "same-origin"});
+  if (r.status === 403) { sessionStorage.removeItem("obwToken"); TOKEN = ""; denied(); throw new Error("not signed in"); }
+  if (!r.ok) { let m = r.status; try { m = (await r.json()).error || m; } catch (e) {} throw new Error(m); }
+  return r.json();
+}
+let timer = null, view = null;
+function stop() { clearTimeout(timer); timer = null; }
+function denied() {
+  stop(); view = "denied";
+  document.getElementById("crumb").textContent = "";
+  status("not signed in", true);
+  const app = document.getElementById("app"); app.textContent = "";
+  const box = $("div", "empty"); box.style.padding = "30px";
+  box.append($("div", null, "This page needs the link obwatch printed in its terminal (the one with ?token=…)."),
+             $("div", null, "obwatch makes a new token each time it starts, so after a restart open the new link."));
+  app.append(box);
+}
+function go() {
+  stop();
+  takeToken();
+  const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
+  if (parts[0] === "agent" && parts[1]) agentPage(decodeURIComponent(parts[1]), parts[2] ? decodeURIComponent(parts[2]) : "activity");
+  else home();
+}
+const store = (k, v) => { try { localStorage[k] = JSON.stringify(v); } catch (e) {} };
+const load = (k, d) => { try { return k in localStorage ? JSON.parse(localStorage[k]) : d; } catch (e) { return d; } };
+
+// ------------------------------------------------------------ overview
+const H = {sel: 0, list: []};
+function home() {
+  view = "home";
+  document.getElementById("crumb").textContent = "all agents";
+  const app = document.getElementById("app"); app.textContent = "";
+  const box = $("div"); app.append(box);
+  const tick = async () => {
+    if (view !== "home") return;
+    try { renderHome(box, (await api("/api/agents")).agents); status("live · " + new Date().toLocaleTimeString()); }
+    catch (e) { if (view !== "home") return; status(String(e.message || e), true); }
+    timer = setTimeout(tick, 2000);
+  };
+  tick();
+}
+function card(a, i) {
+  const work = a.supported && a.state === "working";
+  const c = $("div", "card" + (work ? " work" : "") + (a.supported ? "" : " off") + (i === H.sel ? " sel" : ""));
+  if (a.supported) c.onclick = () => openAgent(a.id);
+  c.append($("h3", null, (i < 9 && a.supported ? (i + 1) + "  " : "") + a.name));
+  const meta = $("div", "line");
+  meta.append($("span", "badge", a.provider));
+  if (!a.supported) meta.append($("span", "c-dim", "not supported"));
+  else {
+    if (!work) meta.append($("span", "c-dim", "idle " + ago(a.idle)));
+    if (a.procs) meta.append($("span", work ? null : "c-dim", (work ? "" : " · ") + `${a.procs} process${a.procs === 1 ? "" : "es"} · CPU ${Math.round(a.cpu)}%` + (a.cpu >= 150 ? ` (≈${Math.round(a.cpu / 100)} cores)` : "") + ` · ${a.mem}`));
+  }
+  c.append(meta);
+  if (a.now) c.append($("div", "line b-cmd", `▶ ${a.now} (${ago(a.now_s)})`));
+  for (const e of a.recent || []) c.append($("div", "line c-" + e.kind, `${e.ts} ${TAG[e.kind] || e.kind} ${e.text.split("\n")[0]}`));
+  return c;
+}
+function renderHome(box, agents) {
+  const work = agents.filter(a => a.supported && a.state === "working");
+  const idle = agents.filter(a => a.supported && a.state !== "working");
+  const off = agents.filter(a => !a.supported);
+  H.list = [...work, ...idle, ...off];
+  H.sel = Math.min(H.sel, Math.max(0, H.list.length - 1));
+  box.textContent = "";
+  let i = 0;
+  for (const [name, list] of [[`Working (${work.length})`, work], [`Idle (${idle.length})`, idle], ["Not supported", off]]) {
+    if (!list.length) continue;
+    box.append($("div", "sect", name));
+    const grid = $("div", "cards");
+    for (const a of list) grid.append(card(a, i++));
+    box.append(grid);
+  }
+  const sel = box.querySelector(".card.sel");
+  if (sel && H.moved) { sel.scrollIntoView({block: "nearest"}); H.moved = false; }
+}
+function openAgent(id) { location.hash = "#/agent/" + encodeURIComponent(id); }
+
+// ------------------------------------------------------------ one agent
+let A = null;
+function agentPage(id, tab) {
+  view = "agent";
+  if (!A || A.id !== id) {
+    A = {id, events: [], since: -1, tabs: [], procs: null, logs: {}, renderKey: "", lastSeq: -1,
+         filters: Object.assign({cmd: 1, out: 1, think: 1, say: 1, msg: 1, tool: 1, err: 1, sub: 0}, load("obwFilters", {})),
+         q: "", follow: true, open: new Set(), closed: new Set(), mdMode: load("obwMdMode", "full"), mdSince: load("obwMdSince", "edits"), files: {}};
+  }
+  A.tab = tab;
+  A.renderKey = "";
+  const app = document.getElementById("app"); app.textContent = "";
+  const lay = $("div", "layout"); A.nav = $("nav"); const main = $("main");
+  if (!load("obwNav", true)) A.nav.classList.add("hidden");
+  A.bar = $("div", "toolbar"); A.pane = $("div"); A.pane.id = "pane";
+  A.pane.onscroll = () => { A.follow = A.pane.scrollTop + A.pane.clientHeight >= A.pane.scrollHeight - 30; };
+  main.append(A.bar, A.pane); lay.append(A.nav, main); app.append(lay);
+  A.follow = true;
+  poll();
+}
+function tabHash(key) { return "#/agent/" + encodeURIComponent(A.id) + "/" + encodeURIComponent(key); }
+async function poll() {
+  if (view !== "agent") return;
+  const me = A;
+  try {
+    const d = await api(`/api/agent?id=${encodeURIComponent(A.id)}&since=${A.since}&tab=${encodeURIComponent(A.tab)}`);
+    if (me !== A || view !== "agent") return;
+    if (d.reset) { A.events = []; A.renderKey = ""; }
+    for (const e of d.events) { A.events.push(e); A.since = Math.max(A.since, e.seq); }
+    if (A.events.length > 6000) { A.events.splice(0, A.events.length - 6000); A.renderKey = ""; }
+    A.info = d.agent; A.tabs = d.tabs; A.procs = d.procs; if (d.files) A.fstat = d.files;
+    document.getElementById("crumb").textContent = "/ " + d.agent.name;
+    status((d.agent.now ? "▶ " + d.agent.now + " · " : "") + (d.agent.state === "working" ? "working" : "idle " + ago(d.agent.idle)));
+    renderNav();
+    await renderPane(d.events.length > 0);
+  } catch (e) { if (view !== "agent") return; status(String(e.message || e), true); }
+  timer = setTimeout(poll, 1500);
+}
+function navKeys() {
+  return ["activity", "changes", "procs", ...A.tabs.filter(t => t.kind === "sub").map(t => t.key),
+          ...A.tabs.filter(t => t.kind === "log" || t.kind === "pinned").map(t => t.key)];
+}
+function renderNav() {
+  const nav = A.nav; nav.textContent = "";
+  const add = (key, label, cls) => { const t = $("div", "tab" + (A.tab === key ? " sel" : "") + (cls ? " " + cls : ""), label);
+    t.title = label; t.onclick = () => { location.hash = tabHash(key); }; nav.append(t); };
+  nav.append($("div", "grp", "Agent"));
+  add("activity", "Activity");
+  const nfiles = new Set(A.events.filter(e => e.change).map(e => e.change.file)).size;
+  add("changes", "Changes" + (nfiles ? ` (${nfiles} file${nfiles === 1 ? "" : "s"})` : ""));
+  const procs = A.tabs.find(t => t.kind === "procs");
+  add("procs", "Processes" + (procs && procs.count ? " (" + procs.count + ")" : ""));
+  const subs = A.tabs.filter(t => t.kind === "sub");
+  if (subs.length) { nav.append($("div", "grp", "Subagents")); for (const t of subs) add(t.key, (t.alive ? "● " : "✓ ") + t.label, t.alive ? "live" : "done"); }
+  const logs = A.tabs.filter(t => t.kind === "log" || t.kind === "pinned");
+  if (logs.length) { nav.append($("div", "grp", "Commands & logs")); for (const t of logs) add(t.key, (t.alive ? "● " : "✓ ") + t.label, t.alive ? "live" : "done"); }
+}
+async function renderPane(changed) {
+  const tab = A.tab;
+  if (tab === "activity") return renderActivity(e => true, changed);
+  if (tab.startsWith("sub:")) return renderActivity(e => e.src === tab.slice(4), changed, true);
+  if (tab === "changes") return renderChanges(changed);
+  if (tab === "procs") return renderProcs();
+  if (tab.startsWith("log:")) return renderLog(tab);
+  A.pane.textContent = "Unknown tab.";
+}
+
+// ---- Activity (also a subagent's tab)
+function toolbarActivity(isSub) {
+  const key = "activity" + isSub;
+  if (A.bar.dataset.kind === key) return;
+  A.bar.dataset.kind = key; A.bar.textContent = "";
+  for (const [k, name] of KINDS) A.bar.append(check(k, name));
+  if (!isSub) A.bar.append(check("sub", "Subagents"));
+  const q = $("input"); q.type = "search"; q.placeholder = "search… (/)"; q.value = A.q; q.id = "search";
+  q.oninput = () => { A.q = q.value.toLowerCase(); A.renderKey = ""; renderPane(true); };
+  A.bar.append(q);
+}
+function check(k, name) {
+  const l = $("label"); const c = $("input"); c.type = "checkbox"; c.checked = !!A.filters[k]; c.dataset.f = k;
+  c.onchange = () => { A.filters[k] = c.checked ? 1 : 0; store("obwFilters", A.filters); A.renderKey = ""; renderPane(true); };
+  l.append(c, " " + name); return l;
+}
+function visible(e, inSub) {
+  if (!A.filters[e.kind]) return false;
+  if (e.kind === "think" && !e.text) return false;
+  if (!inSub && e.side && !A.filters.sub) return false;
+  if (A.q && !((e.text || "") + " " + (e.desc || "") + " " + (e.name || "")).toLowerCase().includes(A.q)) return false;
+  return true;
+}
+function renderActivity(pick, changed, inSub) {
+  toolbarActivity(!!inSub);
+  const key = A.tab + "|" + A.q + "|" + JSON.stringify(A.filters);
+  const evs = A.events.filter(e => pick(e) && visible(e, inSub));
+  if (key !== A.renderKey) {
+    evs.sort((a, b) => (a.epoch || 0) - (b.epoch || 0) || a.seq - b.seq);
+    A.pane.textContent = ""; A.renderKey = key; A.lastSeq = -1;
+    if (!evs.length) A.pane.append($("div", "empty", "Nothing here yet."));
+  } else if (!changed) return;
+  const fresh = evs.filter(e => e.seq > A.lastSeq);
+  if (fresh.length && A.pane.querySelector(".empty")) A.pane.textContent = "";
+  const follow = A.follow;
+  for (const e of fresh) { A.pane.append(eventRow(e, inSub)); A.lastSeq = Math.max(A.lastSeq, e.seq); }
+  if (follow) A.pane.scrollTop = A.pane.scrollHeight;
+}
+function folded(text, cls, lines) {
+  const all = text.split("\n");
+  if (all.length <= lines) return $("pre", cls, text);
+  const d = $("details");
+  d.append($("summary", null, all.slice(0, Math.min(3, lines)).join("\n").slice(0, 400) + `  … ${all.length} lines`));
+  d.append($("pre", cls, text)); return d;
+}
+function eventRow(e, inSub) {
+  const row = $("div", "ev");
+  row.append($("span", "t", e.ts || ""));
+  row.append($("span", "k c-" + e.kind, (e.side && !inSub ? "↳" : "") + (TAG[e.kind] || e.kind)));
+  const body = $("div");
+  if (e.kind === "cmd") {
+    if (e.desc) body.append($("div", "c-dim", "# " + e.desc + (e.bg ? "   [background]" : "")));
+    body.append($("pre", "b-cmd", e.text));
+  } else if (e.kind === "out") body.append(folded(e.text, "b-out", 14));
+  else if (e.kind === "err") body.append(folded(e.text, "c-err", 14));
+  else if (e.kind === "think") body.append(folded(e.text, "c-think", 12));
+  else if (e.kind === "msg") body.append(folded(e.text, "c-msg", 8));
+  else if (e.kind === "tool") {
+    body.append($("pre", "c-tool", (e.name || "") + "  " + e.text.split("\n").slice(0, 3).join("\n")));
+    if (e.change && e.change.diff) { const d = $("details"); d.append($("summary", null, "diff"), sideBySide(e.change.diff)); body.append(d); }
+  } else body.append($("pre", "c-" + e.kind, e.text));
+  row.append(body);
+  return row;
+}
+
+// ---- Changes: grouped by file, Markdown first, side-by-side diffs, rendered Markdown
+const isMd = f => /\.(md|markdown)$/i.test(f);
+// a time of day, with the date in front when it isn't today ("Nov 2 18:29:08")
+function stamp(epoch, ts) {
+  if (!epoch) return ts || "";
+  const d = new Date(epoch * 1000), now = new Date();
+  const t = ts || d.toTimeString().slice(0, 8);
+  return d.toDateString() === now.toDateString() ? t : d.toLocaleDateString("en-US", {month: "short", day: "numeric"}) + " " + t;
+}
+function diffStats(diff) {
+  let a = 0, d = 0;
+  for (const l of diff.split("\n")) { if (l.startsWith("+") && !l.startsWith("+++")) a++; else if (l.startsWith("-") && !l.startsWith("---")) d++; }
+  return [a, d];
+}
+function sideBySide(diff) {
+  const [nAdd, nDel] = diffStats(diff);
+  if (!nAdd || !nDel) return oneSided(diff, nAdd ? "add" : "del");   // a new file or a pure removal: use the full width
+  const t = $("table", "sbs");
+  const cg = $("colgroup"); for (const c of ["ln", "", "ln", ""]) cg.append($("col", c)); t.append(cg);
+  let lo = 0, ln = 0, dels = [], adds = [];
+  const cell = (cls, text) => $("td", cls, text);
+  const flush = () => {
+    for (let i = 0; i < Math.max(dels.length, adds.length); i++) {
+      const tr = $("tr"); const l = dels[i], r = adds[i];
+      tr.append(cell("ln", l ? l[0] : ""), cell(l ? "del" : "none", l ? l[1] : ""), cell("ln", r ? r[0] : ""), cell(r ? "add" : "none", r ? r[1] : ""));
+      t.append(tr);
+    }
+    dels = []; adds = [];
+  };
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("---") || line.startsWith("+++") || line.startsWith("Index:") || line.startsWith("====")) continue;
+    const h = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$/);
+    if (h) { flush(); lo = +h[1]; ln = +h[2]; const tr = $("tr", "hunk"); const td = cell("", line); td.colSpan = 4; tr.append(td); t.append(tr); continue; }
+    if (line.startsWith("-")) dels.push([lo++, line.slice(1)]);
+    else if (line.startsWith("+")) adds.push([ln++, line.slice(1)]);
+    else if (line.startsWith(" ") || line === "") {
+      flush();
+      const tr = $("tr"); tr.append(cell("ln", lo++), cell("", line.slice(1)), cell("ln", ln++), cell("", line.slice(1))); t.append(tr);
+    } else { flush(); const tr = $("tr", "info"); const td = cell("", line); td.colSpan = 4; tr.append(td); t.append(tr); }
+  }
+  flush();
+  return t;
+}
+function oneSided(diff, kind) {
+  const t = $("table", "sbs");
+  const cg = $("colgroup"); cg.append($("col", "ln"), $("col")); t.append(cg);
+  let n = 0;
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("---") || line.startsWith("+++") || line.startsWith("Index:") || line.startsWith("====")) continue;
+    const h = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    const tr = $("tr", h ? "hunk" : /^[-+ ]/.test(line) || line === "" ? "" : "info");
+    if (h) { n = kind === "add" ? +h[2] : +h[1]; const td = $("td", "", line); td.colSpan = 2; tr.append(td); }
+    else if (/^[-+ ]/.test(line) || line === "") tr.append($("td", "ln", n++), $("td", line[0] === "+" || line[0] === "-" ? kind : "", line.slice(1)));
+    else { const td = $("td", "", line); td.colSpan = 2; tr.append(td); }
+    t.append(tr);
+  }
+  return t;
+}
+function renderChanges(changed, force) {
+  const evs = A.events.filter(e => e.change);
+  const fstat = A.fstat || {};
+  const key = "changes|" + evs.length + "|" + JSON.stringify(fstat);   // new edits, or a file saved or deleted
+  if (A.bar.dataset.kind !== "changes") {
+    A.bar.dataset.kind = "changes"; A.bar.textContent = "";
+    A.bar.append($("span", "info", "Files the agent changed. Markdown first; click a file to expand it."));
+    const all = $("button", "hbtn", "expand all"); all.onclick = () => toggleAll(true);
+    const none = $("button", "hbtn", "collapse all"); none.onclick = () => toggleAll(false);
+    A.notice = $("button", "hbtn notice hidden"); A.notice.onclick = () => renderChanges(true, true);
+    A.bar.append(all, none, A.notice);
+  }
+  if (A.renderKey === key && !force) return;   // the files haven't changed: leave the page as it is
+  // New edits while you're reading further down: keep the page still and say so instead of redrawing it.
+  if (!force && A.renderKey.startsWith("changes|") && A.pane.scrollTop > 40) {
+    const n = evs.length - (A.shownChanges || 0);
+    A.notice.textContent = (n > 0 ? `${n} new change${n === 1 ? "" : "s"}` : "files changed") + " · click or press r to show";
+    A.notice.classList.remove("hidden");
+    return;
+  }
+  A.notice.classList.add("hidden");
+  A.renderKey = key; A.shownChanges = evs.length;
+  const groups = new Map();
+  for (const e of evs) {
+    const g = groups.get(e.change.file) || {file: e.change.file, items: [], latest: 0, add: 0, del: 0};
+    g.items.push(e); g.latest = Math.max(g.latest, e.epoch || 0);
+    if (!e.change.failed) { const [a, d] = diffStats(e.change.diff || ""); g.add += a; g.del += d; }
+    groups.set(e.change.file, g);
+  }
+  for (const g of groups.values()) { g.gone = fstat[g.file] === null; g.mtime = fstat[g.file] || 0; }
+  // Markdown first, then other files, then files that no longer exist
+  const rank = g => g.gone ? 2 : isMd(g.file) ? 0 : 1;
+  const list = [...groups.values()].sort((x, y) => (rank(x) - rank(y)) || (y.latest - x.latest));
+  const top = A.pane.scrollTop;
+  A.pane.textContent = "";
+  if (!list.length) { A.pane.append($("div", "empty", "No file edits in this session yet.")); return; }
+  let section = 0;
+  for (const g of list) {
+    const md = isMd(g.file) && !g.gone;
+    if (rank(g) > section) {
+      section = rank(g);
+      A.pane.append($("div", "sect", section === 2 ? "No longer there (deleted or moved since)" : "Other files"));
+    }
+    const d = $("details", "fgroup" + (md ? " mdfile" : "") + (g.gone ? " gone" : ""));
+    d.open = md ? !A.closed.has(g.file) : A.open.has(g.file);
+    d._group = g;
+    d.ontoggle = () => {
+      if (d.open) { A.open.add(g.file); A.closed.delete(g.file); fillGroup(d, g); }
+      else { A.open.delete(g.file); A.closed.add(g.file); }
+    };
+    const s = $("summary");
+    const last = g.items.reduce((m, e) => e.epoch > m.epoch ? e : m);
+    s.append($("span", "fname", g.file), "  ", g.gone ? $("span", "badge", "deleted") : "", $("span", "meta", `${g.items.length} edit${g.items.length === 1 ? "" : "s"} · `),
+             $("span", "add", "+" + g.add), " ", $("span", "del", "−" + g.del),
+             $("span", "meta", " · " + stamp(last.epoch, last.ts)));
+    d.append(s);
+    A.pane.append(d);
+    if (d.open) fillGroup(d, g);
+  }
+  A.pane.scrollTop = top;
+}
+function fillGroup(d, g) {
+  if (d.querySelector(".fbody")) return;
+  const body = $("div", "fbody"); d.append(body);
+  const md = isMd(g.file) && !g.gone;
+  const mode = md ? A.mdMode : "diff";
+  if (md) {
+    const modes = $("div", "modes");
+    for (const [m, label] of MD_MODES) {
+      const b = $("button", "hbtn" + (m === mode ? " on" : ""), label);
+      b.onclick = () => setMdMode(m);
+      modes.append(b);
+    }
+    if (mode !== "diff") {
+      const since = $("select", "since"); since.title = "which changes to highlight";
+      const git = A.files[g.file] && A.files[g.file].f.git;
+      for (const [v, label] of SINCE) {
+        const o = $("option", null, "highlight: " + (v === "edits" && git ? "not committed yet" : label)); o.value = v; since.append(o);
+      }
+      since.value = A.mdSince; since.onchange = () => { A.mdSince = since.value; store("obwMdSince", since.value); redrawMd(); };
+      modes.append(" ", since, $("span", "legend", " "), $("span", "lg-add", "added"), " ", $("span", "lg-mod", "changed"), " ", $("span", "lg-del", "removed"));
+    }
+    body.append(modes);
+  }
+  if (mode !== "diff") {
+    const box = $("div"); body.append(box);
+    const show = f => {
+      box.className = ""; box.textContent = "";
+      if (f.missing) return box.append($("div", "c-dim", "The file no longer exists or is too large to show."));
+      const r = markdownChanges(f, mode);
+      const un = (f.history || {}).unmatched || 0;
+      const steps = f.steps || [], nEdits = steps.filter(x => !x.outside).length;
+      const w = onlyWritten(f) && steps[steps.length - 1];
+      const outside = steps.find(x => x.outside);
+      let text;
+      if (w) text = `Written in one go at ${stamp(w.epoch, w.ts)} (${ago(Date.now() / 1000 - (w.epoch || 0))} ago) and not edited since, so all of it is new.` +
+        ` Pick "everything the agent wrote" above to see it marked.`;
+      else {
+        const what = gitMode(f) ? (f.git.tracked ? ` not committed yet (last commit ${f.git.head}, ${stamp(f.git.time)})` : " (new file, not in git yet)") : "";
+        text = `${r.marked} block${r.marked === 1 ? "" : "s"} added or changed, ${r.removed} removal${r.removed === 1 ? "" : "s"}${what}.` +
+          ` The agent made ${nEdits} edit${nEdits === 1 ? "" : "s"} with its edit tools; hover a block for when, "before" shows what it replaced.` +
+          (outside ? ` Changes marked "by a command" were made some other way (a shell command, a script, another program), so their exact time is unknown; the file was last saved ${stamp(outside.epoch, outside.ts)}.` : "") +
+          (un ? ` ${un} edit${un === 1 ? "" : "s"} couldn't be traced exactly, because the text was changed again since; their lines are matched by content.` : "");
+      }
+      box.append($("div", "mdinfo", text), r.root);
+    };
+    const cached = A.files[g.file], at = g.latest + "|" + g.mtime;
+    if (cached && cached.at === at) return show(cached.f);   // drawn at once, so the page doesn't jump
+    if (cached) show(cached.f); else { box.className = "c-dim"; box.textContent = "loading…"; }
+    api(`/api/file?id=${encodeURIComponent(A.id)}&path=${encodeURIComponent(g.file)}`).then(f => {
+      const hadGit = cached && cached.f.git;
+      A.files[g.file] = {f, at}; show(f);
+      if (f.git && !hadGit) { body.remove(); fillGroup(d, g); }   // relabel the highlight menu for git
+    }).catch(e => { box.textContent = "Couldn't load the file: " + (e.message || e); });
+    return;
+  }
+  const c = A.files[g.file], f = c && c.f;
+  if (md && (!c || c.at !== g.latest + "|" + g.mtime)) {   // get the git diff, then draw again
+    api(`/api/file?id=${encodeURIComponent(A.id)}&path=${encodeURIComponent(g.file)}`).then(nf => {
+      A.files[g.file] = {f: nf, at: g.latest + "|" + g.mtime};
+      if (nf.gitdiff !== (f && f.gitdiff) && body.isConnected) { body.remove(); fillGroup(d, g); }
+    }).catch(() => {});
+  }
+  if (md && f && f.gitdiff) {   // everything not committed yet, however it was changed
+    const ed = $("div", "edit");
+    ed.append($("div", "hd", `not committed yet: everything changed since ${f.git.tracked ? "commit " + f.git.head + " (" + stamp(f.git.time) + ")" : "this file was created (not in git yet)"}`), sideBySide(f.gitdiff));
+    body.append(ed, $("div", "sect", "Edits made with the agent's edit tools"));
+  }
+  for (const e of [...g.items].sort((x, y) => (y.epoch || 0) - (x.epoch || 0))) {
+    const ed = $("div", "edit" + (e.change.failed ? " failed" : ""));
+    ed.append($("div", "hd", `${stamp(e.epoch, e.ts)}  ${e.change.op}${e.side ? "  (subagent)" : ""}${e.change.failed ? "  · failed, not applied" : ""}`), sideBySide(e.change.diff || ""));
+    body.append(ed);
+  }
+}
+const MD_MODES = [["full", "rendered: whole file"], ["only", "rendered: changes only"], ["diff", "diffs"]];
+function setMdMode(m) { A.mdMode = m; store("obwMdMode", m); redrawMd(); }
+function redrawMd() {   // redraw the open Markdown files in place, keeping the scroll position
+  const top = A.pane.scrollTop;
+  for (const d of A.pane.querySelectorAll("details.mdfile")) {
+    const b = d.querySelector(".fbody"); if (b) { b.remove(); if (d.open) fillGroup(d, d._group); }
+  }
+  A.pane.scrollTop = top;
+}
+function toggleAll(open) {
+  for (const d of A.pane.querySelectorAll("details")) d.open = open;
+}
+
+// ---- a small, safe Markdown renderer (builds DOM nodes; never inserts HTML)
+function inline(el, text) {
+  const re = /(!\[[^\]]*\]\([^)\s]+\))|(`[^`]+`)|(\*\*[^*]+\*\*|__[^_]+__)|(\*[^*\s][^*]*\*|_[^_\s][^_]*_)|(~~[^~]+~~)|(\[[^\]]+\]\([^)\s]+\))|(https?:\/\/[^\s<>()]+)/g;
+  let last = 0, m;
+  while ((m = re.exec(text))) {
+    if (m.index > last) el.append(text.slice(last, m.index));
+    const t = m[0];
+    if (m[1]) { const [, alt, src] = t.match(/^!\[([^\]]*)\]\(([^)\s]+)\)$/); const im = $("span", "mdimg", "🖼 " + (alt || src)); im.title = src; el.append(im); }
+    else if (m[2]) el.append($("code", null, t.slice(1, -1)));
+    else if (m[3]) { const b = $("strong"); inline(b, t.slice(2, -2)); el.append(b); }
+    else if (m[4]) { const i = $("em"); inline(i, t.slice(1, -1)); el.append(i); }
+    else if (m[5]) { const s = $("del"); inline(s, t.slice(2, -2)); el.append(s); }
+    else if (m[6]) {
+      const [, label, href] = t.match(/^\[([^\]]+)\]\(([^)\s]+)\)$/);
+      if (/^https?:\/\//.test(href)) { const a = $("a"); a.href = href; a.target = "_blank"; a.rel = "noopener noreferrer"; inline(a, label); el.append(a); }
+      else { const s = $("span"); s.title = href; inline(s, label); el.append(s); }
+    } else { const a = $("a", null, t); a.href = t; a.target = "_blank"; a.rel = "noopener noreferrer"; el.append(a); }
+    last = m.index + t.length;
+  }
+  if (last < text.length) el.append(text.slice(last));
+}
+function markdown(text) {
+  const root = $("div", "md");
+  root.append(mdBlocks(text.replace(/\r/g, "").split("\n")));
+  return root;
+}
+const LIST = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
+// Every rendered piece remembers its source lines (data-l0 .. data-l1, end excluded) and leaf pieces get the
+// class "ml", so the Changes view can mark what an edit added or changed.
+function lines_(el, l0, l1) { el.dataset.l0 = l0; el.dataset.l1 = l1; el.classList.add("ml"); return el; }
+function mdBlocks(lines, base) {
+  base = base || 0;
+  const out = document.createDocumentFragment();
+  let i = 0;
+  const isBlockStart = l => /^\s*```/.test(l) || /^#{1,6}\s/.test(l) || /^\s*>/.test(l) || LIST.test(l) || /^\s*\|/.test(l);
+  while (i < lines.length) {
+    const l = lines[i], at = base + i;
+    let m;
+    if (/^\s*```/.test(l)) {
+      const pre = $("pre", "code"); pre.dataset.l0 = at; i++;
+      while (i < lines.length && !/^\s*```/.test(lines[i])) { pre.append(lines_($("span", "cl", lines[i]), base + i, base + i + 1), "\n"); i++; }
+      i++; pre.dataset.l1 = base + Math.min(i, lines.length);
+      if (!pre.childNodes.length) lines_(pre, at, +pre.dataset.l1);
+      out.append(pre); continue;
+    }
+    if ((m = l.match(/^(#{1,6})\s+(.*?)\s*#*\s*$/))) { const h = lines_($("h" + m[1].length), at, at + 1); inline(h, m[2]); out.append(h); i++; continue; }
+    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(l)) { out.append(lines_($("hr"), at, at + 1)); i++; continue; }
+    if (/^\s*>/.test(l)) {
+      const buf = []; while (i < lines.length && /^\s*>/.test(lines[i])) buf.push(lines[i++].replace(/^\s*>\s?/, ""));
+      const q = $("blockquote"); q.dataset.l0 = at; q.dataset.l1 = base + i; q.append(mdBlocks(buf, at)); out.append(q); continue;
+    }
+    if (/^\s*\|.*\|\s*$/.test(l) && i + 1 < lines.length && /^\s*\|?\s*:?-{2,}/.test(lines[i + 1])) {
+      const cells = s => s.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map(c => c.trim());
+      const t = $("table"); t.dataset.l0 = at; const hr = lines_($("tr"), at, at + 2);
+      for (const c of cells(l)) { const th = $("th"); inline(th, c); hr.append(th); }
+      t.append(hr); i += 2;
+      while (i < lines.length && /^\s*\|/.test(lines[i])) {
+        const tr = lines_($("tr"), base + i, base + i + 1); for (const c of cells(lines[i++])) { const td = $("td"); inline(td, c); tr.append(td); } t.append(tr);
+      }
+      t.dataset.l1 = base + i; out.append(t); continue;
+    }
+    if (LIST.test(l)) {
+      const items = [];
+      while (i < lines.length) {
+        const mm = lines[i].match(LIST);
+        if (mm) { items.push({ind: mm[1].length, ord: /\d/.test(mm[2]), text: mm[3], l0: base + i, l1: base + i + 1}); i++; }
+        else if (lines[i].trim() && /^\s{2,}/.test(lines[i]) && items.length) { const it = items[items.length - 1]; it.text += " " + lines[i].trim(); it.l1 = base + i + 1; i++; }
+        else break;
+      }
+      const stack = [];
+      for (const it of items) {
+        while (stack.length && it.ind < stack[stack.length - 1].ind) stack.pop();
+        let top = stack[stack.length - 1];
+        if (!top || it.ind > top.ind) {
+          const L = $(it.ord ? "ol" : "ul"); L.dataset.l0 = it.l0;
+          if (top && top.list.lastElementChild) top.list.lastElementChild.append(L); else out.append(L);
+          top = {ind: it.ind, list: L}; stack.push(top);
+        }
+        const li = lines_($("li"), it.l0, it.l1); let text = it.text;
+        const task = text.match(/^\[( |x|X)\]\s+(.*)$/);
+        if (task) { li.append(task[1] === " " ? "☐ " : "☑ "); text = task[2]; }
+        inline(li, text); top.list.append(li);
+      }
+      if (stack.length) stack[0].list.dataset.l1 = base + i;
+      continue;
+    }
+    if (!l.trim()) { i++; continue; }
+    const buf = [];
+    while (i < lines.length && lines[i].trim() && !(buf.length && isBlockStart(lines[i]))) buf.push(lines[i++].trim());
+    const p = lines_($("p"), at, base + i); inline(p, buf.join(" ")); out.append(p);
+  }
+  return out;
+}
+
+// ---- Markdown with the agent's edits marked: when each block got its text, what was removed, and a
+// "changes only" view that folds away everything the edits didn't touch.
+const SINCE = [["edits", "edits after it was written"], ["all", "everything the agent wrote"], ["3600", "last hour"], ["600", "last 10 min"], ["latest", "latest edit only"]];
+function shownSteps(f) {
+  const steps = f.steps || [], sel = new Set();
+  if (!steps.length) return sel;
+  const since = A.mdSince || "edits";
+  const newest = Math.max(...steps.map(s => s.epoch || 0));
+  const lastWrite = Math.max(-1, ...steps.map((s, i) => s.write ? i : -1));
+  steps.forEach((s, i) => {
+    if (since === "all" || (since === "edits" && i > lastWrite) || (since === "latest" ? (s.epoch || 0) === newest : (s.epoch || 0) >= Date.now() / 1000 - +since)) sel.add(i);
+  });
+  return sel;
+}
+function stepLabel(s, kind) {
+  const what = kind === "mod" ? "changed" : kind === "del" ? "removed" : "added";
+  if (s.outside) return `${what} by a command or another program (not an edit tool), not committed yet; file last saved ${stamp(s.epoch, s.ts)}`;
+  return `${what} ${stamp(s.epoch, s.ts)} · ${ago(Date.now() / 1000 - (s.epoch || 0))} ago${s.side ? " · subagent" : ""}`;
+}
+// Word-level differences between two texts, as DOM (removed words struck through, added ones marked).
+function wordDiff(a, b) {
+  const tok = t => t.split(/(\s+|[.,;:!?()\[\]`*|])/).filter(Boolean);
+  const x = tok(a), y = tok(b), box = $("div", "wdiff");
+  if (x.length * y.length > 4e6) { box.append($("del", null, a), " ", $("ins", null, b)); return box; }
+  const n = x.length, m = y.length, L = Array.from({length: n + 1}, () => new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) L[i][j] = x[i] === y[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+  let i = 0, j = 0;
+  while (i < n || j < m) {
+    if (i < n && j < m && x[i] === y[j]) { box.append(x[i]); i++; j++; }
+    else if (i < n && (j >= m || L[i + 1][j] >= L[i][j + 1])) box.append($("del", null, x[i++]));   // removed first, then added
+    else box.append($("ins", null, y[j++]));
+  }
+  return box;
+}
+// Written in one go and not edited since: with "edits after it was written" nothing is highlighted, and the
+// whole file is shown, since all of it is new.
+const gitMode = f => (A.mdSince || "edits") === "edits" && f.git && f.history && f.history.fresh;
+const onlyWritten = f => !gitMode(f) && (A.mdSince || "edits") === "edits" && (f.steps || []).length > 0 && f.steps[f.steps.length - 1].write;
+function markdownChanges(f, mode) {
+  const text = f.text.replace(/\r/g, ""), src = text.split("\n");
+  const root = $("div", "md"); root.append(mdBlocks(src));
+  const h = f.history || {lines: [], kind: [], removed: []}, steps = f.steps || [], sel = shownSteps(f);
+  // "not committed yet" for files in git: whatever differs from the last commit, however it got there
+  const git = gitMode(f);
+  const lineOn = n => git ? h.fresh[n] : h.lines[n] >= 0 && sel.has(h.lines[n]);
+  const newest = steps.length ? Math.max(...steps.map(s => s.epoch || 0)) : 0;
+  const leaves = [...root.querySelectorAll(".ml")];
+  const leafAt = n => leaves.find(el => +el.dataset.l0 <= n && n < +el.dataset.l1);
+  const leafFrom = n => leaves.find(el => +el.dataset.l1 > n);   // the piece at or after line n (blank lines have none)
+  let marked = 0, prevKey = "";
+  for (const el of leaves) {
+    const l0 = +el.dataset.l0, l1 = +el.dataset.l1, hit = new Set();
+    let mod = false;
+    for (let n = l0; n < l1; n++) { if (lineOn(n)) { hit.add(h.lines[n]); if (h.kind[n] === "mod") mod = true; } }
+    if (!hit.size) { prevKey = ""; continue; }
+    const last = Math.max(...hit), key = [...hit].join(",");
+    el.classList.add("hl", mod ? "hl-mod" : "hl-add");
+    if ((steps[last].epoch || 0) === newest && !steps[last].outside) el.classList.add("hl-new");
+    el.title = [...hit].sort((a, b) => a - b).map(s => stepLabel(steps[s], mod ? "mod" : "add")).join("\n");
+    if (key !== prevKey && !el.classList.contains("cl")) {   // one time badge per run of lines from the same edits
+      const badge = $("span", "when", (mod ? "~ " : "+ ") + (steps[last].outside ? "by a command" : stamp(steps[last].epoch, steps[last].ts)));
+      if (el.tagName === "TR") { if (el.lastElementChild) el.lastElementChild.append(badge); } else el.prepend(badge);
+    }
+    prevKey = key; marked++;
+  }
+  // what the edits took out: changed text gets a "before" toggle, removed text a red marker where it was
+  let removed = 0;
+  for (const r of h.removed) {
+    if (git ? !r.fresh : !sel.has(r.step)) continue;
+    const s = steps[r.step];
+    const el = leafAt(Math.min(r.at, src.length - 1));
+    if (r.mod && el) {
+      const now = src.slice(r.at, r.at + r.mod).join("\n");
+      const det = $("details", "before"); det.append($("summary", null, s.outside ? "before" : `before ${stamp(s.epoch, s.ts)}`), wordDiff(r.text, now));
+      const host = el.tagName === "TR" ? el.closest("table") : el.classList.contains("cl") ? el.closest("pre") : el;
+      if (host === el) el.append(det); else host.after(det);
+      continue;
+    }
+    const gone = r.text.replace(/^\s*\n|\n\s*$/g, "");
+    if (!gone.trim()) continue;   // only blank lines went
+    const n = gone.split("\n").length;
+    const det = $("details", "removed");
+    det.append($("summary", null, `− removed ${n} line${n === 1 ? "" : "s"} · ` + (s.outside ? "by a command" : `${stamp(s.epoch, s.ts)} · ${ago(Date.now() / 1000 - (s.epoch || 0))} ago${s.side ? " · subagent" : ""}`)), $("pre", null, gone));
+    let target = leafFrom(r.at) || null;
+    if (target && target.tagName === "TR") target = target.closest("table");
+    if (target && target.classList.contains("cl")) target = target.closest("pre");
+    if (target) target.before(det); else root.append(det);
+    removed++;
+  }
+  if (mode === "only" && !onlyWritten(f)) foldUnchanged(root);
+  return {root, marked, removed};
+}
+// "changes only": hide what the edits didn't touch, keep the headings above each change for context,
+// and leave a "⋯" in each gap that shows the hidden part when clicked.
+function foldUnchanged(root) {
+  const touched = el => el.matches(".hl,.removed,.before") || el.querySelector(".hl,.removed,.before");
+  for (const el of root.querySelectorAll("li.ml, tr.ml")) {   // inside a changed list or table, only the changed items
+    if (touched(el)) continue;
+    if (el.tagName === "TR" && el === el.parentNode.firstElementChild) continue;   // keep the header row
+    el.classList.add("fold");
+  }
+  for (const list of root.querySelectorAll("ul, ol")) {   // a "⋯" where list items are hidden
+    let hid = [];
+    const mark = before => {
+      if (!hid.length) return;
+      const g = $("li", "gapli", `⋯ ${hid.length} more`), these = hid;
+      g.onclick = () => { for (const x of these) x.classList.remove("fold"); g.remove(); };
+      list.insertBefore(g, before); hid = [];
+    };
+    for (const li of [...list.children]) { if (li.classList.contains("fold")) hid.push(li); else mark(li); }
+    mark(null);
+  }
+  const kids = [...root.children], heads = [];
+  const keep = new Set();
+  for (const el of kids) {
+    const hm = el.tagName.match(/^H(\d)$/);
+    if (hm) { const lv = +hm[1]; while (heads.length && heads[heads.length - 1].lv >= lv) heads.pop(); heads.push({lv, el}); }
+    if (touched(el)) { keep.add(el); for (const x of heads) if (x.el !== el && !keep.has(x.el)) { keep.add(x.el); x.el.classList.add("ctx"); } }
+  }
+  let run = [];
+  const gap = before => {
+    if (!run.length) return;
+    const g = $("div", "gap", `⋯ ${run.length} unchanged block${run.length === 1 ? "" : "s"}`), hidden = run;
+    g.title = "show them"; g.onclick = () => { for (const x of hidden) x.classList.remove("fold"); g.remove(); };
+    root.insertBefore(g, before); run = [];
+  };
+  for (const el of kids) { if (keep.has(el)) gap(el); else { el.classList.add("fold"); run.push(el); } }
+  gap(null);
+  if (!keep.size) root.append($("div", "c-dim", "No changes in this time range."));
+}
+
+// ---- Processes
+function renderProcs() {
+  const p = A.procs || {items: []};
+  A.bar.dataset.kind = "procs"; A.bar.textContent = "";
+  A.bar.append($("span", "info", p.summary || ""));
+  const top = A.pane.scrollTop;
+  A.pane.textContent = "";
+  A.pane.append($("div", "c-dim", p.hint), $("br"));
+  if (!p.items.length) { A.pane.append($("div", "empty", "No processes running.")); return; }
+  const t = $("table", "procs"); const h = $("tr");
+  for (const c of ["PID", "CPU", "MEM", "TIME", "COMMAND"]) h.append($("th", null, c));
+  t.append(h);
+  for (const it of p.items) {
+    const r = $("tr");
+    r.append($("td", "n", it.pid), $("td", "n", it.cpu + "%"), $("td", "n", it.mem), $("td", "n", it.time));
+    const c = $("td"); c.style.paddingLeft = (8 + it.depth * 16) + "px";
+    c.append($("pre", it.depth ? "" : "b-cmd", (it.via ? "[systemd-run] " : "") + it.cmd));
+    if (it.out) c.append($("div", "c-dim", "↳ output: " + it.out));
+    r.append(c); t.append(r);
+  }
+  A.pane.append(t);
+  A.pane.scrollTop = top;
+}
+
+// ---- a command's log
+async function renderLog(key) {
+  const info = A.tabs.find(t => t.key === key);
+  if (A.bar.dataset.kind !== key) {
+    A.bar.dataset.kind = key; A.bar.textContent = "";
+    A.pane.textContent = ""; A.logs[key] = {last: -1, box: $("pre", "log")}; A.pane.append(A.logs[key].box);
+    A.partial = $("span", "c-dim"); A.pane.append(A.partial);
+  }
+  if (info) A.bar.textContent = (info.alive ? "running " + ago(Date.now() / 1000 - (info.started || 0)) : "finished") +
+    (info.pids && info.pids.length ? " · pid " + info.pids.slice(0, 4).join(",") : "") + " · " + info.path;
+  const L = A.logs[key];
+  try {
+    const d = await api(`/api/log?id=${encodeURIComponent(A.id)}&key=${encodeURIComponent(key.slice(4))}&since=${L.last}`);
+    if (d.reset) L.box.textContent = "";
+    const follow = A.follow;
+    for (const line of d.lines) {
+      L.box.append($("span", /\b(ERROR|FATAL|panic|panicked|Traceback|failed|error:)/i.test(line) ? "e" : /\bWARN/i.test(line) ? "w" : "", line + "\n"));
+    }
+    while (L.box.childNodes.length > 8000) L.box.removeChild(L.box.firstChild);
+    L.last = d.last; A.partial.textContent = d.partial || "";
+    if (follow) A.pane.scrollTop = A.pane.scrollHeight;
+  } catch (e) { if (view === "agent") A.pane.textContent = "This tab has closed."; }
+}
+
+// ------------------------------------------------------------ keyboard
+const help = document.getElementById("help");
+document.getElementById("helpbtn").onclick = () => help.classList.toggle("hidden");
+help.onclick = e => { if (e.target === help) help.classList.add("hidden"); };
+function setNav(show) { store("obwNav", show); if (A && A.nav) A.nav.classList.toggle("hidden", !show); }
+function navWidth(d) {
+  const cur = load("obwNavW", 270); const w = Math.max(150, Math.min(700, cur + d));
+  store("obwNavW", w); document.documentElement.style.setProperty("--navw", w + "px");
+}
+document.documentElement.style.setProperty("--navw", load("obwNavW", 270) + "px");
+// ------------------------------------------------------------ btop pane
+// A real terminal: xterm.js (served by obwatch) draws it, btop runs on a pseudo-terminal on the server, and a
+// WebSocket connects the two. btop starts when the pane opens and is stopped when it closes or the page goes.
+const T = {term: null, ws: null, fit: null, libs: null};
+const tpane = document.getElementById("tpane"), tbox = document.getElementById("tbox"), tkb = document.getElementById("tkb");
+function loadLibs() {
+  if (T.libs) return T.libs;
+  const css = $("link"); css.rel = "stylesheet"; css.href = "/assets/xterm.css"; document.head.append(css);
+  const js = src => new Promise((ok, bad) => { const s = $("script"); s.src = src; s.onload = ok;
+    s.onerror = () => bad(new Error("couldn't load " + src)); document.head.append(s); });
+  T.libs = js("/assets/xterm.js").then(() => Promise.all(["addon-fit", "addon-webgl", "addon-unicode11"].map(a => js(`/assets/${a}.js`))));
+  T.libs.catch(() => { T.libs = null; });
+  return T.libs;
+}
+function termHeight(pct) {
+  pct = Math.max(12, Math.min(92, pct)); store("obwTermH", pct);
+  tpane.style.height = pct + "vh";
+  for (const b of document.querySelectorAll("#tbar [data-h]")) b.classList.toggle("on", +b.dataset.h === pct);
+  termFit();
+}
+function termFont(d) {
+  const fs = Math.max(7, Math.min(20, load("obwTermFont", 12) + d)); store("obwTermFont", fs);
+  document.getElementById("tfs").textContent = fs + "px";
+  if (T.term) { T.term.options.fontSize = fs; termFit(); }
+}
+function termFit() {
+  if (!T.term || !T.fit) return;
+  try { T.fit.fit(); } catch (e) {}
+  const small = T.term.rows < 24 || T.term.cols < 80;   // btop's minimum
+  document.getElementById("tsmall").classList.toggle("hidden", !small);
+}
+async function termOpen() {
+  if (T.term) return;
+  store("obwTerm", true);
+  tpane.classList.remove("hidden"); document.getElementById("tbtn").classList.add("on");
+  termHeight(load("obwTermH", 40)); termFont(0);
+  tbox.textContent = ""; tbox.append($("div", "msg", "starting btop…"));
+  try { await loadLibs(); }
+  catch (e) {
+    let why = e.message;
+    try { const r = await fetch("/assets/xterm.js", {credentials: "same-origin"}); if (!r.ok) why = (await r.json()).error || why; } catch (x) {}
+    tbox.textContent = ""; tbox.append($("div", "msg", "The terminal can't start: " + why)); return;
+  }
+  if (tpane.classList.contains("hidden") || T.term) return;   // closed again while loading
+  tbox.textContent = "";
+  const term = new Terminal({fontFamily: '"Cascadia Mono", "JetBrains Mono", "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", monospace',
+    fontSize: load("obwTermFont", 12), allowProposedApi: true, scrollback: 0, cursorBlink: false, macOptionIsMeta: true,
+    theme: {background: "#16181d", foreground: "#c8ccd4"}});
+  T.term = term; T.fit = new FitAddon.FitAddon(); term.loadAddon(T.fit);
+  term.loadAddon(new Unicode11Addon.Unicode11Addon()); term.unicode.activeVersion = "11";
+  term.open(tbox);
+  try { const gl = new WebglAddon.WebglAddon(); gl.onContextLoss(() => gl.dispose()); term.loadAddon(gl); } catch (e) {}   // sharper; falls back to the DOM renderer
+  termFit();
+  term.attachCustomKeyEventHandler(e => {
+    if (e.type === "keydown" && e.ctrlKey && (e.key === "]" || e.code === "BracketRight")) { term.blur(); return false; }
+    return true;
+  });
+  term.textarea.addEventListener("focus", () => { tkb.classList.add("on"); tkb.textContent = "typing into btop · Ctrl+] gives the keys back to the page"; });
+  term.textarea.addEventListener("blur", () => { tkb.classList.remove("on"); tkb.textContent = "click it (or press T) to type into btop · Ctrl+] gives the keys back"; });
+  const ws = new WebSocket(`ws://${location.host}/term?cols=${term.cols}&rows=${term.rows}`);
+  T.ws = ws; ws.binaryType = "arraybuffer";
+  const enc = new TextEncoder();
+  ws.onmessage = m => term.write(new Uint8Array(m.data));
+  ws.onclose = ev => {
+    if (T.ws !== ws) return;
+    T.ws = null;
+    term.write(`\r\n\x1b[90m[${ev.reason || "btop stopped"} · press t twice to restart]\x1b[0m`);
+  };
+  term.onData(d => { if (ws.readyState === 1) ws.send(enc.encode(d)); });
+  term.onBinary(d => { if (ws.readyState === 1) ws.send(Uint8Array.from(d, c => c.charCodeAt(0))); });
+  term.onResize(({cols, rows}) => { if (ws.readyState === 1) ws.send(JSON.stringify({resize: [cols, rows]})); });
+  T.ro = new ResizeObserver(() => termFit()); T.ro.observe(tbox);
+}
+function termClose() {
+  store("obwTerm", false);
+  tpane.classList.add("hidden"); document.getElementById("tbtn").classList.remove("on");
+  if (T.ro) T.ro.disconnect();
+  const ws = T.ws; T.ws = null; if (ws) ws.close(1000, "closed");
+  if (T.term) T.term.dispose();
+  T.term = T.fit = null; tbox.textContent = "";
+}
+const termToggle = () => T.term || !tpane.classList.contains("hidden") ? termClose() : termOpen();
+document.getElementById("tbtn").onclick = termToggle;
+document.getElementById("tclose").onclick = termClose;
+document.getElementById("tfm").onclick = () => termFont(-1);
+document.getElementById("tfp").onclick = () => termFont(1);
+for (const b of document.querySelectorAll("#tbar [data-h]")) b.onclick = () => termHeight(+b.dataset.h);
+document.getElementById("tgrip").onmousedown = e => {
+  e.preventDefault(); const grip = e.target; grip.classList.add("drag");
+  const move = ev => { tpane.style.height = Math.max(80, window.innerHeight - ev.clientY) + "px"; termFit(); };
+  const up = ev => { grip.classList.remove("drag"); document.removeEventListener("mousemove", move); document.removeEventListener("mouseup", up);
+    termHeight(Math.round((window.innerHeight - ev.clientY) / window.innerHeight * 100)); };
+  document.addEventListener("mousemove", move); document.addEventListener("mouseup", up);
+};
+window.addEventListener("pagehide", () => { if (T.ws) T.ws.close(1000, "page closed"); });
+if (load("obwTerm", false)) termOpen();
+
+document.addEventListener("keydown", e => {
+  if (T.term && T.term.textarea === e.target) return;   // keys typed into btop are btop's
+  const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName);
+  if (typing) { if (e.key === "Escape") e.target.blur(); return; }
+  if (e.altKey && (e.key === "+" || e.key === "=" || e.key === "-")) { termFont(e.key === "-" ? -1 : 1); return e.preventDefault(); }
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = e.key;
+  if (k === "t") { termToggle(); return e.preventDefault(); }
+  if (k === "T") { if (!T.term) termOpen(); else T.term.focus(); return e.preventDefault(); }
+  if ((k === "+" || k === "=" || k === "-") && T.term) { termHeight(load("obwTermH", 40) + (k === "-" ? -5 : 5)); return e.preventDefault(); }
+  if (k === "?") { help.classList.toggle("hidden"); e.preventDefault(); return; }
+  if (!help.classList.contains("hidden")) { if (k === "Escape") help.classList.add("hidden"); return; }
+  const done = () => e.preventDefault();
+  if (k === "\\") { setNav(!load("obwNav", true)); return done(); }
+  if (k === "<") { navWidth(-40); return done(); }
+  if (k === ">") { navWidth(40); return done(); }
+  if (view === "home") {
+    const n = H.list.length;
+    if (k === "j" || k === "ArrowDown" || k === "ArrowRight") { H.sel = Math.min(n - 1, H.sel + 1); H.moved = true; }
+    else if (k === "k" || k === "ArrowUp" || k === "ArrowLeft") { H.sel = Math.max(0, H.sel - 1); H.moved = true; }
+    else if (k === "Enter" || k === "o") { const a = H.list[H.sel]; if (a && a.supported) openAgent(a.id); }
+    else if (/^[1-9]$/.test(k)) { const a = H.list[+k - 1]; if (a && a.supported) openAgent(a.id); }
+    else return;
+    for (const [i, c] of document.querySelectorAll(".card").entries()) c.classList.toggle("sel", i === H.sel);
+    const sel = document.querySelector(".card.sel"); if (sel) sel.scrollIntoView({block: "nearest"});
+    return done();
+  }
+  if (view !== "agent") return;
+  const pane = A.pane, line = 40;
+  if (k === "Escape" || k === "h") location.hash = "#/";
+  else if (k === "[" || k === "]") { const keys = navKeys(); const i = keys.indexOf(A.tab); location.hash = tabHash(keys[(i + (k === "]" ? 1 : -1) + keys.length) % keys.length]); }
+  else if (k === "a") location.hash = tabHash("activity");
+  else if (k === "c") location.hash = tabHash("changes");
+  else if (k === "p") location.hash = tabHash("procs");
+  else if (k === "j" || k === "ArrowDown") pane.scrollTop += line;
+  else if (k === "k" || k === "ArrowUp") pane.scrollTop -= line;
+  else if (k === " ") pane.scrollTop += (e.shiftKey ? -1 : 1) * pane.clientHeight * 0.9;
+  else if (k === "PageDown") pane.scrollTop += pane.clientHeight * 0.9;
+  else if (k === "PageUp") pane.scrollTop -= pane.clientHeight * 0.9;
+  else if (k === "g" || k === "Home") { pane.scrollTop = 0; A.follow = false; }
+  else if (k === "G" || k === "End") { pane.scrollTop = pane.scrollHeight; A.follow = true; }
+  else if (k === "f") { A.follow = !A.follow; status(A.follow ? "following new lines" : "not following"); if (A.follow) pane.scrollTop = pane.scrollHeight; }
+  else if (k === "/") { const s = document.getElementById("search"); if (s) s.focus(); else location.hash = tabHash("activity"); }
+  else if (k === "s") { A.filters.sub = A.filters.sub ? 0 : 1; store("obwFilters", A.filters); A.renderKey = ""; A.bar.dataset.kind = ""; renderPane(true); }
+  else if (k === "e") { const ds = [...pane.querySelectorAll("details")]; const open = ds.some(d => !d.open); for (const d of ds) d.open = open; }
+  else if (k === "r" && A.tab === "changes") renderChanges(true, true);
+  else if (k === "m" && A.tab === "changes") { const i = MD_MODES.findIndex(x => x[0] === A.mdMode); setMdMode(MD_MODES[(i + 1) % MD_MODES.length][0]); status("Markdown: " + MD_MODES[(i + 1) % MD_MODES.length][1]); }
+  else if (k === "H" && A.tab === "changes") { const i = SINCE.findIndex(x => x[0] === A.mdSince); A.mdSince = SINCE[(i + 1) % SINCE.length][0]; store("obwMdSince", A.mdSince); redrawMd(); status("highlight: " + SINCE[(i + 1) % SINCE.length][1]); }
+  else return;
+  done();
+});
+
+// start only now that everything above is defined
+window.addEventListener("hashchange", go);
+go();
+</script></body></html>
+"""
+
+
 def plain(agent):
     colors = dict(say="\033[36m", think="\033[35m", cmd="\033[1;33m", msg="\033[32m", err="\033[31m",
                   tool="\033[1;34m", out="", dim="\033[2m")
@@ -1521,9 +3324,15 @@ def main():
     ap.add_argument("agent", nargs="?", help="part of the agent's name or id")
     ap.add_argument("-f", "--follow", action="append", default=[], help="pin this log file as a tab (repeatable)")
     ap.add_argument("--plain", action="store_true", help="stream the activity feed without the TUI")
+    ap.add_argument("--web", action="store_true", help="serve a web page on this machine instead of the terminal view")
+    ap.add_argument("--port", type=int, default=8765, help="port for --web (default 8765)")
+    ap.add_argument("--lan", action="store_true",
+                    help="with --web: listen on the local network (the default route's interface) instead of this machine only")
     ap.add_argument("--version", action="version", version=f"obwatch {__version__}")
     args = ap.parse_args()
     args.follow = [os.path.abspath(os.path.expanduser(p)) for p in args.follow]
+    if args.web:
+        return web(args.port, args.lan)
     agents = load_agents()
     start = None
     if args.agent:

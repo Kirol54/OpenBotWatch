@@ -4,13 +4,55 @@ All notable changes to obwatch. Versions follow [semantic versioning](https://se
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-03
+
+The web page release: everything obwatch shows in the terminal, in a browser, plus a review view of what the agent changed and btop at the bottom of the page.
+
 ### Added
+
+**Web page** (`obwatch --web`)
+- **Overview** of every agent, with **working agents in their own section** at the top (green edge, pulsing "● working") and idle ones below: what each is running now, its last few actions, processes and CPU.
+- **Agent page:** Activity with expandable outputs and reasoning, filters (commands, output, reasoning, messages, tools, errors, subagents), search, and auto-follow; tabs for subagents, live command logs and processes.
+- **Keyboard controls** for everything; `?` lists them. Open agents with `1`–`9` or `j`/`k` and `Enter`. On an agent: `[` `]` for tabs, `a`/`c`/`p`, `j`/`k`/`Space` to scroll, `g`/`G`, `f` follow, `/` search, `s` subagents, `e` expand all. `\` and `<` `>` for the tab list.
+
+**Changes: a review of what the agent changed**
+- Every file the agent edited or wrote, **grouped by file**, Markdown first and expanded, other files collapsed until you open them, with +/− counts.
+- **Side-by-side diffs** with line numbers. New files and pure removals use the full width. Failed edits (for example, text not found) are marked "failed, not applied" and left out of the counts.
+- **Rendered Markdown** with the changes marked: green for added, yellow for changed, each with the time of the edit. "before" on a changed block shows what it replaced, word by word, and red markers show removed text.
+- **Whole file, changes only, or diffs** (`m` switches). "Changes only" shows just the changed parts under their headings, with `⋯` for hidden parts (click to show).
+- **Changes made any way are marked**, for files in a git repository. By default the view marks everything not committed yet, so changes made with shell commands or scripts show up too, marked "by a command". Edits made with edit tools keep their time. Diffs add one diff of everything not committed yet.
+- **Which changes to mark** (`H` switches): not committed yet (git) or the edits after the file was written (outside git), everything the agent wrote, the last hour, the last 10 minutes, or the latest edit. A file written in one go and not edited since says so.
+- Edits that were changed again later, for example by another agent, are matched by their lines.
+- Files that no longer exist are listed last, marked "deleted". Edits from earlier days show their date.
+- **The page stays still while you read:** when files change while you're scrolled down, a notice says so instead of redrawing; click it or press `r` to show the changes.
+
+**btop at the bottom of every page**
+- `t` or "▤ btop" opens a real terminal running btop on the server, in full color and properly aligned. It uses xterm.js (the terminal VS Code uses), downloaded once from the npm registry, checked against hashes built into obwatch and cached in `~/.cache/obwatch`. The browser loads it from obwatch, never from the internet.
+- btop runs only while the pane is open, and stops when it closes, when the page goes away, or when obwatch exits.
+- Resize the pane with S/M/L/XL, by dragging its top edge, or with `+`/`-`. Change the font with `Alt`+`+`/`-` so all CPU cores fit. The pane says when it's too small for btop.
+- Click it or press `T` to type into btop; `Ctrl`+`]` gives the keys back to the page.
+
+**Access and security**
+- By default it listens on 127.0.0.1 only; reach it from your computer with `ssh -L`.
+- `--lan` opens it to your **local network only**: it listens only on the default route's interface (not VPN or Docker), answers only clients inside that network, and refuses to start on a network that isn't private.
+- The printed link (`/?token=…`) signs the browser in with a cookie (HttpOnly, SameSite=Strict), so every page, tab and reload works until obwatch restarts. Without it, the page says which link to open.
+- Every request needs the token; requests addressed to any other host are refused, and the btop connection is refused from other origins.
+- The terminal running `--web` **logs every connection attempt**: new clients, page loads, btop opened and closed, and refused requests with the reason (wrong token, wrong host, outside the network, https instead of http). Live updates are summarized once a minute. When nothing arrives, it suggests the firewall rule to check.
+
+**Terminal view**
 - **A tab per subagent**, for both Claude Code and opencode agents: `↳●` while it runs, `↳✓` when done, named after the subagent's description (opencode: its session title), showing its own commands and output.
 - `s` toggles subagent lines in Activity. They're off by default, so Activity shows the main agent; each subagent has its own tab.
 
+**For contributors**
+- `AGENTS.md` (and `CLAUDE.md`, which points to it): rules for agents and people working on the repo, above all that nothing from the maintainer's machine, network or conversations may be committed.
+- A privacy test (`test_no_personal_data`) that fails on real-looking IP addresses (examples must use the RFC 5737 documentation ranges), home directories, emails, UUIDs and session IDs, plus a private word list kept outside the repo (`~/.config/obwatch/private-words`). `dev/pre-commit` runs it as a git hook.
+- Tests for the web server, the edit history, the git baseline and the terminal connection; `dev/demo.py` now includes Markdown edits.
+
 ### Fixed
+- **Switching Claude accounts no longer freezes an agent's view.** OpenBot keeps each Claude account's sessions in its own folder (`~/.config/OpenBot/provider-accounts/<account>/projects`). obwatch only read `~/.claude/projects`, so after a switch it stopped seeing new activity. It now reads every account's folder, and picks up newly added accounts while it runs.
 - A background Claude subagent no longer also shows up as a plain "task …" tab with its raw transcript.
 - Activity is in time order. Before, lines from the main session and its subagents were grouped by file instead of interleaved by time.
+- The opencode database connection failed when used from another thread.
 
 ## [0.2.1] - 2026-11-03
 

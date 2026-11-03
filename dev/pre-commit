@@ -1,0 +1,9 @@
+#!/bin/sh
+# git pre-commit hook: refuse the commit if the staged files contain personal or machine-specific data.
+# Install: ln -s ../../dev/pre-commit .git/hooks/pre-commit
+cd "$(git rev-parse --show-toplevel)" || exit 1
+if ! out=$(OBWATCH_CHECK_STAGED=1 python3 -m unittest discover -s tests -k Privacy 2>&1); then
+    echo "$out" >&2
+    echo "pre-commit: personal or machine-specific data in the staged files (listed above). Nothing was committed." >&2
+    exit 1
+fi

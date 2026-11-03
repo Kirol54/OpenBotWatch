@@ -10,6 +10,55 @@ When I use OpenBot agents for coding, the chat only shows me the agent's summary
 
 ![Activity tab](docs/activity.png)
 
+## Web page
+
+Prefer a browser? `obwatch --web` serves the same information as a page:
+
+![Overview of all agents](docs/web-overview.png)
+
+![An agent's activity in the browser](docs/web-agent.png)
+
+- **Overview:** every agent at once: working or idle, what it's running now, its last few actions, processes and CPU.
+- **Agent page:** Activity with expandable outputs and reasoning, filters, search and auto-follow, plus tabs for subagents, live command logs and processes.
+- **Changes:** files the agent edited, grouped by file with side-by-side diffs. Markdown files come first and are rendered, with the agent's edits marked:
+  - green for added, yellow for changed, each with the time of the edit; "before" on a changed block shows what it replaced, word by word, and red markers show removed text;
+  - **whole file** or **changes only** (just the changed parts, under their headings, with `⋯` for what's hidden), or plain **diffs** (`m` switches);
+  - which changes to mark (`H` switches): by default, for a file in a git repository, **everything not committed yet**, however it was changed: lines from the agent's edit tools show the time of the edit, and lines changed by a shell command or another program say "by a command". Outside git, the default is the edits after the file was written. Or: everything the agent wrote, the last hour, the last 10 minutes, or only the latest edit.
+  - in diffs, a git file also gets one diff of everything not committed yet.
+  - edits from earlier days show their date, and files that no longer exist are listed last, marked "deleted".
+- **btop at the bottom of every page** (`t`, or the "▤ btop" button): a real terminal in the page running btop on the server, in full color. btop runs only while the pane is open. Size it with S/M/L/XL, by dragging its top edge, or with `+`/`-`, and change the font with `Alt`+`+`/`-` until all your CPU cores fit. Click it (or press `T`) to type into btop; `Ctrl`+`]` gives the keys back to the page.
+- **Keyboard:** press `?` on the page for all shortcuts.
+
+![Changes: rendered Markdown with the agent's edits marked, changes only](docs/web-changes.png)
+
+```bash
+obwatch --web               # prints a link with a secret token; --port to change 8765
+```
+
+It only listens on the server itself (127.0.0.1). To open it from your computer, forward the port over SSH, then open the printed link:
+
+```bash
+ssh -L 8765:localhost:8765 you@your-server
+```
+
+Or open it to your **local network only**:
+
+```bash
+obwatch --web --lan         # e.g. http://192.0.2.50:8765/?token=…
+```
+
+- `--lan` listens only on the address of the network interface your server reaches the internet through (its default route), not on VPN or Docker interfaces.
+- It only answers devices whose address is inside that network.
+- It refuses to start if that network isn't a private one.
+- The page is plain HTTP, so anyone who can watch traffic on your network could see the token. Use `--lan` on a network you trust.
+- **If the page keeps loading forever**, a firewall on the server is probably dropping the port, and nothing shows up in obwatch's connection log. With ufw: `sudo ufw allow from 192.0.2.0/24 to 192.0.2.50 port 8765 proto tcp` (use the network and address obwatch prints).
+
+The terminal running `--web` logs every connection attempt: new clients, page loads, and refused requests with the reason. The page's live updates are summarized once a minute.
+
+The btop pane uses [xterm.js](https://xtermjs.org/), the terminal VS Code uses. To keep obwatch a single file, the first time you open the pane obwatch downloads xterm.js 6.0.0 from the npm registry, checks it against hashes built into obwatch, and keeps it in `~/.cache/obwatch`. Your browser loads it from obwatch, not from the internet. The pane needs `btop` installed on the server. btop's own keys work in it, including the ones that kill processes, and anyone with the link can use it, so the same care applies as for the link itself.
+
+Open the printed link once: it signs that browser in with a cookie (HttpOnly, SameSite=Strict), so other pages, new tabs and reloads work until obwatch restarts. Each start makes a new token, so after a restart open the new link. The token is required for every request, and the page refuses requests addressed to any other host, so other websites in your browser can't read it. Don't share the link: transcripts can contain secrets.
+
 ## Features
 
 - **Activity tab:** a live feed of the agent's session:
@@ -44,6 +93,7 @@ When I use OpenBot agents for coding, the chat only shows me the agent's summary
 - Linux, on the machine where OpenBot runs. obwatch reads `/proc`. It works fine over SSH.
 - Python 3.8 or newer.
 - Agents on the **Claude** or **opencode** provider. Agents on other providers appear in the list as "not supported".
+- For the web page's btop pane only: `btop`, and internet access once to download xterm.js.
 
 ## Install
 
@@ -68,6 +118,7 @@ obwatch                       # pick an agent from a list
 obwatch coder                 # open the agent whose name contains "coder"
 obwatch coder -f ~/app.log    # also pin any log file as a tab
 obwatch coder --plain         # just print the activity feed, no tabs (good for piping or tmux panes)
+obwatch --web                 # the web page (see above)
 obwatch --version
 ```
 
@@ -103,7 +154,7 @@ OpenBot doesn't run the agent loop itself. It hands each agent to a **harness**:
 | What | Claude Code | opencode |
 |---|---|---|
 | Agent names and workspaces | `~/.config/OpenBot/openbot.db`, opened read-only; order from `openbot-sidebar-layout-v1.json` | same |
-| Activity feed | `~/.claude/projects/<workspace>/*.jsonl` (or `$CLAUDE_CONFIG_DIR/projects`), including subagents | `~/.local/share/opencode/opencode.db` (or `$XDG_DATA_HOME/opencode`), opened read-only: sessions whose directory is the agent's workspace, plus the ones OpenBot recorded for it, plus their subagents |
+| Activity feed | `~/.claude/projects/<workspace>/*.jsonl` (or `$CLAUDE_CONFIG_DIR/projects`), plus `~/.config/OpenBot/provider-accounts/*/projects/<workspace>` for each Claude account you've added to OpenBot, including subagents | `~/.local/share/opencode/opencode.db` (or `$XDG_DATA_HOME/opencode`), opened read-only: sessions whose directory is the agent's workspace, plus the ones OpenBot recorded for it, plus their subagents |
 | Which processes belong to the agent | they inherit `CLAUDE_CODE_SESSION_ID` | they inherit `OPENCODE_SESSION_ID` |
 | Subagents | `<session>/subagents/agent-*.jsonl` with a `.meta.json` (description, type, finished) | child sessions in `opencode.db` (`parent_id`); title, agent, busy/idle times |
 | Command output files | `/tmp/claude-<uid>/<workspace>/<session>/tasks/*.output` | `~/.local/share/opencode/shell/<project>/sh_*.out` |
@@ -120,11 +171,12 @@ MCP servers that the harness starts are filtered out, so only the agent's own co
 - **Linux only**, because it relies on `/proc`.
 - A program that writes to its own log file (not stdout) only becomes a tab if the file ends in `.log`, `.out`, `.output` or `.txt`. Pin anything else with `-f`.
 - Processes inside Docker containers aren't visible. The `docker build` / `docker run` command's own output is.
+- Changes lists the files the agent changed with its edit tools. A file it only ever changed with shell commands (`sed`, a script) isn't listed; for listed files in git, such changes are still marked.
 - The file formats come from OpenBot, Claude Code and opencode internals and may change between versions. Tested with OpenBot 0.54.0, Claude Code 2.1.312–2.1.316 and opencode 2.2.5.
 
 ## Privacy
 
-Session files can contain anything the agent has seen, including secrets that appear in command output. obwatch only shows them in your terminal and sends nothing anywhere. Take care when you share screenshots of it.
+Session files can contain anything the agent has seen, including secrets that appear in command output. obwatch only shows them in your terminal or on the web page and sends nothing anywhere. Its only outgoing connection is the one-time xterm.js download when you first open the btop pane, which sends nothing about you or your agents. Take care when you share screenshots of it.
 
 ## Development
 
@@ -151,6 +203,10 @@ python3 dev/demo.py start
 HOME=/tmp/obwatch-demo/home python3 dev/screenshot.py docs/
 python3 dev/demo.py stop
 ```
+
+## Contributing
+
+Read [AGENTS.md](AGENTS.md) first. This repo is public, and nothing from anyone's machine, network or agent conversations may be committed. The tests include a privacy check, and `dev/pre-commit` runs it before every commit.
 
 ## License
 
