@@ -10,7 +10,8 @@ the Claude Code and opencode providers (opencode covers local LLMs too).
   obwatch coder --plain   no TUI, just stream the activity feed
 
 Keys:  Tab/Shift-Tab or <-/->/1-9 switch tabs   Up/Down/PgUp/PgDn/g scroll
-       G or End follow   e expand outputs   x / X close tab / all finished tabs
+       G or End follow   e expand outputs   s subagent lines in Activity
+       x / X close tab / all finished tabs
        a agent list      q quit
 """
 __version__ = "0.2.1"
@@ -141,6 +142,9 @@ class Agent:
         """Processes that belong to the agent but can't be found by their session variable."""
         return []
 
+    def subagents(self):
+        return []
+
 
 class ClaudeAgent(Agent):
     kind = "claude"
@@ -158,9 +162,29 @@ class ClaudeAgent(Agent):
                 pass
         return max(ts, default=0)
 
+    def subagents(self):
+        """The agent's subagents, as dicts: key (the feed's `src` for its events), label, kind, finished,
+        started, updated, where. Claude Code writes <session>/subagents/agent-*.jsonl with a .meta.json
+        next to it (description, agentType, and finished: true when done)."""
+        res = []
+        for f in glob.glob(os.path.join(self.projdir, "*", "subagents", "agent-*.jsonl")):
+            meta_file = f[:-6] + ".meta.json"
+            try:
+                updated = os.path.getmtime(f)
+                started = os.path.getctime(meta_file) if os.path.exists(meta_file) else updated
+                meta = json.loads(read(meta_file)) if os.path.exists(meta_file) else {}
+            except (OSError, ValueError):
+                continue
+            res.append(dict(key=f, label=meta.get("description") or os.path.basename(f)[:-6],
+                            kind=meta.get("agentType") or "subagent", finished=bool(meta.get("finished")),
+                            started=started, updated=updated, where=f))
+        return res
+
     def output_files(self):
         name = os.path.basename(self.projdir)
-        return glob.glob(f"{tempfile.gettempdir()}/claude-{os.getuid()}/{name}/*/tasks/*.output")
+        files = glob.glob(f"{tempfile.gettempdir()}/claude-{os.getuid()}/{name}/*/tasks/*.output")
+        # a background subagent's task file is a link to its transcript: it has a subagent tab instead
+        return [f for f in files if not os.path.islink(f) or not os.readlink(f).endswith(".jsonl")]
 
     def make_feed(self):
         return Feed(self)
@@ -229,6 +253,20 @@ class OpencodeAgent(Agent):
             if (p["pid"] not in keep and not p["sid"] and par and base(par) == "opencode"
                     and any(abs(c - p["start"]) < SAME_START for c in starts)):
                 res.append(p)
+        return res
+
+    def subagents(self):
+        """Child sessions (opencode's subagents). A session is busy until its time_idle passes its time_busy."""
+        ids = self.sessions()
+        if not ids:
+            return []
+        rows = OcDB.q(f"select id, title, agent, time_created, time_updated, time_busy, time_idle from session_v2 "
+                      f"where id in ({marks(len(ids))}) and parent_id in ({marks(len(ids))})", [*ids, *ids])
+        res = []
+        for sid, title, kind, created, updated, busy, idle in rows:
+            res.append(dict(key=sid, label=title or sid, kind=kind or "subagent",
+                            finished=bool(idle and idle >= (busy or 0)), started=(created or 0) / 1000,
+                            updated=(updated or 0) / 1000, where=f"opencode session {sid}"))
         return res
 
     def make_feed(self):
@@ -518,6 +556,7 @@ class Feed:
         self.total = 0
         self.tools, self.task_desc, self.pending = {}, {}, collections.OrderedDict()
         self.primed = False
+        self.ctx = {}   # epoch, src (session file) and side (subagent?) of the record being read
 
     def poll(self):
         files = glob.glob(os.path.join(self.agent.projdir, "**/*.jsonl"), recursive=True)
@@ -542,16 +581,16 @@ class Feed:
                 self.part[p] = lines[-1]
             for line in lines[:-1]:
                 try:
-                    self.add(json.loads(line))
+                    self.add(json.loads(line), p)
                 except (ValueError, AttributeError):
                     pass
         self.primed = True
 
     def ev(self, ts, kind, text, **kw):
-        self.events.append(dict(ts=ts, kind=kind, text=text, **kw))
+        self.events.append(dict(self.ctx, ts=ts, kind=kind, text=text, **kw))
         self.total += 1
 
-    def add(self, rec):
+    def add(self, rec, src=None):
         t = rec.get("type")
         if t not in ("user", "assistant"):
             return
@@ -562,6 +601,7 @@ class Feed:
         except (KeyError, ValueError):
             pass
         side = bool(rec.get("isSidechain"))
+        self.ctx = dict(epoch=epoch, src=src, side=side)
         content = (rec.get("message") or {}).get("content")
         if isinstance(content, str):
             content = [{"type": "text", "text": content}]
@@ -604,11 +644,15 @@ class Feed:
         now = time.time()
         return [v for v in self.pending.values() if now - v[0] < (MODEL_STALE if v[2] == "model" else TOOL_STALE)]
 
-    def rows(self, expand):
-        """-> list of (ts, tag, style, text)"""
+    def rows(self, expand, src=None, main_only=False):
+        """-> list of (ts, tag, style, text), oldest first. `src`: only that session file (a subagent);
+        `main_only`: leave out subagents."""
         out = []
-        for e in self.events:
-            k, ts, pre = e["kind"], e["ts"], "↳" if e.get("side") else ""
+        events = sorted(self.events, key=lambda e: e.get("epoch") or 0)   # files are read one at a time
+        for e in events:
+            if (src and e.get("src") != src) or (main_only and e.get("side")):
+                continue
+            k, ts, pre = e["kind"], e["ts"], "↳" if e.get("side") and not src else ""
             if k == "msg":
                 out.append((ts, pre + "IN", "msg", e["text"] if expand else clip(e["text"], 6)))
             elif k == "say":
@@ -672,13 +716,16 @@ class OcFeed(Feed):
         sids = self.agent.sessions()
         if not sids:
             return
-        sql = (f"select id, type, time_created, time_updated, data from session_message "
+        roots = {r[0] for r in OcDB.q(f"select id from session_v2 where id in ({marks(len(sids))}) and "
+                                      f"(parent_id is null or parent_id not in ({marks(len(sids))}))", [*sids, *sids])}
+        sql = (f"select id, type, time_created, time_updated, data, session_id from session_message "
                f"where session_id in ({marks(len(sids))}) and type in ('user', 'assistant', 'synthetic') ")
         if self.primed:
             rows = OcDB.q(sql + "and time_updated >= ? order by time_created, seq", [*sids, self.since])
         else:   # start with the last messages, however old
             rows = OcDB.q(sql + f"order by time_created desc, seq desc limit {OC_BACKLOG}", sids)[::-1]
-        for mid, typ, created, updated, data in rows:
+        for mid, typ, created, updated, data, sid in rows:
+            self.ctx = dict(epoch=(created or 0) / 1000, src=sid, side=sid not in roots)
             self.since = max(self.since, updated or 0)
             if self.seen.get(mid) == updated:
                 continue   # unchanged since the last poll
@@ -828,6 +875,32 @@ def pipe_readers(inodes, procs):
     return res
 
 
+class SubTab:
+    """One subagent's own activity, taken from the agent's feed."""
+
+    def __init__(self, sub, feed, expand):
+        self.path, self.feed, self.expand = sub["key"], feed, expand
+        self.pinned, self.alive, self.pids, self.bottom, self.unread, self.pos = False, True, [], None, 0, None
+        self.started = self.ended = None
+        self.seen, self.cache, self.key = 0, [], None
+        self.update(sub)
+
+    def update(self, sub):
+        self.label, self.kind, self.where = sub["label"], sub["kind"], sub["where"]
+        self.finished = sub["finished"]
+
+    def poll(self):
+        n = sum(1 for e in self.feed.events if e.get("src") == self.path)
+        new, self.seen, self.pos = n - self.seen, n, n
+        return max(new, 0)
+
+    def all_rows(self):
+        key = (self.feed.total, self.expand())
+        if key != self.key:
+            self.cache, self.key = self.feed.rows(self.expand(), src=self.path), key
+        return self.cache
+
+
 class ProcTab:
     """Every process the agent started, as a tree: CPU, memory, and where its output goes."""
     path = "__procs__"
@@ -930,6 +1003,7 @@ class View:
         self.dismissed = {}      # path -> when the user closed it; stays closed until a new process writes there
         self.act_bottom, self.act_unread = None, 0
         self.expand = False
+        self.show_sub = False    # subagent lines in Activity (they also have their own tabs)
         self.rows_cache, self.rows_key = [], None
 
     def oc_shell_procs(self, f, aps, procs):
@@ -1017,7 +1091,7 @@ class View:
             t.pids = sorted(p["pid"] for p in ps)
             t.started = started_at(f, ps)
         for f, t in list(self.tabs.items()):
-            if t is self.ptab:
+            if t is self.ptab or isinstance(t, SubTab):
                 continue
             if f not in jobs and t.alive:
                 t.alive, t.ended = False, now
@@ -1026,9 +1100,28 @@ class View:
             short = not os.path.exists(f) or self.is_foreground(f)
             if t.ended and now - t.ended > (KEEP_GONE if short else KEEP_DONE):
                 del self.tabs[f]
+        self.refresh_subagents(now)
         done = [t for t in self.ordered() if not t.alive and not t.pinned and t.path != self.sel]
         for t in done[MAX_DONE:]:
             del self.tabs[t.path]
+
+    def refresh_subagents(self, now):
+        """A tab per subagent: running until its meta says finished (or it goes quiet), then kept a while."""
+        for sub in self.agent.subagents():
+            f, updated = sub["key"], sub["updated"]
+            alive = not sub["finished"] and now - updated < TOOL_STALE
+            t = self.tabs.get(f)
+            if t is None:
+                if f in self.dismissed or not (alive or now - updated < KEEP_DONE):
+                    continue
+                t = self.tabs[f] = SubTab(sub, self.feed, lambda: self.expand)
+                t.started = sub["started"]
+            t.update(sub)
+            t.alive = alive
+            t.ended = None if alive else (t.ended or updated)
+        for f, t in list(self.tabs.items()):
+            if isinstance(t, SubTab) and not t.alive and f != self.sel and now - (t.ended or now) > KEEP_DONE:
+                del self.tabs[f]
 
     def ordered(self):
         """Processes, pinned tabs, then running (oldest first), then finished (most recent first)."""
@@ -1089,9 +1182,9 @@ class View:
         return t
 
     def act_rows(self):
-        key = (self.feed.total, self.expand)
+        key = (self.feed.total, self.expand, self.show_sub)
         if key != self.rows_key:
-            self.rows_cache, self.rows_key = self.feed.rows(self.expand), key
+            self.rows_cache, self.rows_key = self.feed.rows(self.expand, main_only=not self.show_sub), key
         return self.rows_cache
 
     def running_count(self):
@@ -1215,7 +1308,8 @@ def draw_view(win, v):
     order = v.ordered()
     items = [(None, "1 Activity" + (f" +{v.act_unread}" if v.act_unread else ""))]
     for i, t in enumerate(order, 2):
-        mark = "⚙" if t is v.ptab else "≡" if t.pinned else "●" if t.alive else "✓"
+        mark = ("⚙" if t is v.ptab else "≡" if t.pinned else ("↳" if isinstance(t, SubTab) else "") +
+                ("●" if t.alive else "✓"))
         lab = t.label if len(t.label) <= 26 else t.label[:25] + "…"
         unread = f" +{t.unread}" if 0 < t.unread < 1000 else " +999" if t.unread else ""
         items.append((t, f"{i if i <= 9 else ''} {mark} {lab}".strip() + unread))
@@ -1249,6 +1343,11 @@ def draw_view(win, v):
     if t is None:
         follow = v.act_bottom is None
         draw_body(win, top, bottom_row - top, w, v.act_rows(), v.act_bottom, act_lines)
+    elif isinstance(t, SubTab):
+        state = f"running {ago(now - (t.started or now))}" if t.alive else f"finished {ago(now - (t.ended or now))} ago"
+        put(win, 2, 0, f" subagent · {t.kind} · {state} · {t.where}".ljust(w), STYLES["dim"] | curses.A_REVERSE)
+        follow = t.bottom is None
+        draw_body(win, 3, bottom_row - 3, w, t.all_rows(), t.bottom, act_lines)
     elif t is v.ptab:
         put(win, 2, 0, t.summary.ljust(w), STYLES["dim"] | curses.A_REVERSE)
         follow = t.bottom is None
@@ -1263,7 +1362,8 @@ def draw_view(win, v):
         put(win, 2, 0, info.ljust(w), STYLES["dim"] | curses.A_REVERSE)
         follow = t.bottom is None
         draw_body(win, 3, bottom_row - 3, w, t.all_rows(), t.bottom, log_lines)
-    foot = " ←/→ tabs  ↑/↓ PgUp/PgDn scroll  G follow  e expand  x close tab  X close finished  a agents  q quit "
+    foot = (" ←/→ tabs  ↑/↓ PgUp/PgDn scroll  G follow  e expand  s subagents in Activity"
+            f"{' (on)' if v.show_sub else ''}  x/X close  a agents  q quit ")
     mode = (" LIVE " if t is v.ptab else " FOLLOW ") if follow else " PAUSED (G to follow) "
     put(win, h - 1, 0, foot.ljust(w - len(mode))[: w - len(mode)], STYLES["bar"])
     put(win, h - 1, max(w - len(mode) - 1, 0), mode, STYLES["tabsel"] if follow else STYLES["err"] | curses.A_REVERSE)
@@ -1364,6 +1464,9 @@ def tui(stdscr, args, agents, start):
             newb = 0
         elif k in (ord("G"), curses.KEY_END, ord("f")):
             newb = None
+        elif k == ord("s"):
+            view.show_sub = not view.show_sub
+            view.act_bottom = None
         elif k == ord("e"):
             view.expand = not view.expand
             last_scan = 0

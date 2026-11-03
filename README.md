@@ -21,6 +21,7 @@ When I use OpenBot agents for coding, the chat only shows me the agent's summary
   - `│` / `ERR`: the command's output, or its error
   - `TOOL`: file reads, edits, searches, and other tools
 - **Processes tab:** every process the agent started, as a tree with CPU, memory and run time (with the total in cores, e.g. "CPU 2900% (≈29 cores)"), plus **where each one's output goes**: a file (with a tab), the terminal, a pipe or socket read by another program, or `/dev/null`. Programs launched through `systemd-run` are included too, although they run outside the agent's process tree.
+- **A tab per subagent** (Claude Code and opencode): its own commands, output and messages, named after its description. Activity shows only the main agent unless you press `s`.
 - **One tab per running process**, found automatically:
   - foreground commands while they run,
   - background jobs,
@@ -79,6 +80,7 @@ obwatch --version
 | `↑` `↓` `PgUp` `PgDn` `g` | scroll (pauses the live view) |
 | `G` / `End` | follow live output again |
 | `e` | show shortened outputs in full |
+| `s` | show or hide subagent lines in Activity |
 | `x` | close this tab (a running process keeps running) |
 | `X` | close all finished tabs |
 | `a` / `Esc` | back to the agent list |
@@ -87,7 +89,7 @@ obwatch --version
 
 ### Tabs
 
-- The tab bar is ordered: **Activity**, **Processes** (`⚙`), pinned files (`≡`), **running** tabs (oldest first), then a yellow `┃` and the **finished** tabs (most recent first).
+- The tab bar is ordered: **Activity**, **Processes** (`⚙`), pinned files (`≡`), **running** tabs (subagents are marked `↳`) (oldest first), then a yellow `┃` and the **finished** tabs (most recent first).
 - Tab numbers follow this order, so a number can change when something finishes.
 - When there are more tabs than fit, `«3` and `5»` show how many are hidden on each side.
 - Tabs are named after the agent's description of the command (e.g. "Build the Docker image"), or after the program (e.g. `api-server`, `docker build`), or after the log file.
@@ -103,6 +105,7 @@ OpenBot doesn't run the agent loop itself. It hands each agent to a **harness**:
 | Agent names and workspaces | `~/.config/OpenBot/openbot.db`, opened read-only; order from `openbot-sidebar-layout-v1.json` | same |
 | Activity feed | `~/.claude/projects/<workspace>/*.jsonl` (or `$CLAUDE_CONFIG_DIR/projects`), including subagents | `~/.local/share/opencode/opencode.db` (or `$XDG_DATA_HOME/opencode`), opened read-only: sessions whose directory is the agent's workspace, plus the ones OpenBot recorded for it, plus their subagents |
 | Which processes belong to the agent | they inherit `CLAUDE_CODE_SESSION_ID` | they inherit `OPENCODE_SESSION_ID` |
+| Subagents | `<session>/subagents/agent-*.jsonl` with a `.meta.json` (description, type, finished) | child sessions in `opencode.db` (`parent_id`); title, agent, busy/idle times |
 | Command output files | `/tmp/claude-<uid>/<workspace>/<session>/tasks/*.output` | `~/.local/share/opencode/shell/<project>/sh_*.out` |
 
 Both session variables survive `setsid`/`nohup`, so detached servers and builds are found too. Children of those processes count as well, even when a tool started them with a cleaned environment. An opencode command that drops the environment itself (`env -i …`) is matched by start time against the agent's `sh_*.out` files. obwatch looks them up in `/proc` and follows the files they write to: their stdout/stderr, plus open files ending in `.log`, `.out`, `.output` or `.txt`. Programs started with `systemd-run` lose the variable; obwatch finds them by their systemd unit name (`--unit=`), or by the output pipe they share with `systemd-run --pipe`.

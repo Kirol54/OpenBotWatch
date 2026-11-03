@@ -4,6 +4,14 @@ All notable changes to obwatch. Versions follow [semantic versioning](https://se
 
 ## [Unreleased]
 
+### Added
+- **A tab per subagent**, for both Claude Code and opencode agents: `↳●` while it runs, `↳✓` when done, named after the subagent's description (opencode: its session title), showing its own commands and output.
+- `s` toggles subagent lines in Activity. They're off by default, so Activity shows the main agent; each subagent has its own tab.
+
+### Fixed
+- A background Claude subagent no longer also shows up as a plain "task …" tab with its raw transcript.
+- Activity is in time order. Before, lines from the main session and its subagents were grouped by file instead of interleaved by time.
+
 ## [0.2.1] - 2026-11-03
 
 ### Fixed

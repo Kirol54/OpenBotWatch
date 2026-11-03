@@ -188,16 +188,44 @@ def oc_messages():
     return rows
 
 
+def oc_sub_messages():
+    now = time.time() * 1000
+    sub = OC_SESSION + "_sub"
+
+    def m(i, sec_ago, kind, data):
+        t = now - sec_ago * 1000
+        data.setdefault("time", {"created": t, "completed": t + 500})
+        return (f"msg_sub{i}", sub, kind, i, t, t + 500, json.dumps(data))
+
+    return [
+        m(1, 40, "user", {"text": "Review the TTL cache added to src/lookup.py. Look for stale data and thread-safety issues."}),
+        m(2, 35, "assistant", {"content": [
+            {"type": "reasoning", "text": "Check how the cache is keyed and whether two requests can race on a miss.",
+             "time": {"created": now - 35000, "completed": now - 34000}},
+            {"type": "tool", "id": "call_sub_1", "name": "grep", "time": {"created": now - 33000, "completed": now - 32800},
+             "state": {"status": "completed", "input": {"pattern": "ttl_cache", "path": "src"},
+                       "content": [{"type": "text", "text": "src/lookup.py:3: @ttl_cache(seconds=600)\nsrc/cache.py:8: def ttl_cache(seconds):"}],
+                       "metadata": {}}},
+            {"type": "text", "text": "Keys are lower-cased city names, so 'Oslo' and 'oslo' share an entry. Checking the lock next."}]}),
+    ]
+
+
 def oc_setup():
     os.makedirs(f"{OC_DIR}/shell/{OC_PROJECT}", exist_ok=True)
     db = sqlite3.connect(f"{OC_DIR}/opencode.db")
     db.execute("create table project (id text, worktree text)")
-    db.execute("create table session_v2 (id text, project_id text, parent_id text, directory text, time_updated integer)")
+    db.execute("create table session_v2 (id text, project_id text, parent_id text, directory text, time_updated integer, "
+               "title text, agent text, time_created integer, time_busy integer, time_idle integer)")
     db.execute("create table session_message (id text, session_id text, type text, seq integer, "
                "time_created integer, time_updated integer, data text)")
     db.execute("insert into project values (?, ?)", (OC_PROJECT, OC_WS))
-    db.execute("insert into session_v2 values (?, ?, null, ?, ?)", (OC_SESSION, OC_PROJECT, OC_WS, int(time.time() * 1000)))
-    db.executemany("insert into session_message values (?, ?, ?, ?, ?, ?, ?)", oc_messages())
+    now = int(time.time() * 1000)
+    db.execute("insert into session_v2 values (?, ?, null, ?, ?, 'Cache the weather lookup', 'build', ?, ?, ?)",
+               (OC_SESSION, OC_PROJECT, OC_WS, now, now - 95000, now - 95000, now - 60000))
+    # a subagent the agent started to review its change; still busy
+    db.execute("insert into session_v2 values (?, ?, ?, ?, ?, 'Review the cache change', 'general', ?, ?, null)",
+               (OC_SESSION + "_sub", OC_PROJECT, OC_SESSION, OC_WS, now, now - 40000, now - 40000))
+    db.executemany("insert into session_message values (?, ?, ?, ?, ?, ?, ?)", oc_messages() + oc_sub_messages())
     db.commit()
     with open(f"{ROOT}/app/bench.py", "w") as f:
         f.write(BENCH)

@@ -134,6 +134,41 @@ class ClaudeFeed(unittest.TestCase):
         self.assertEqual(feed.running(), [])
 
 
+class Subagents(unittest.TestCase):
+    def test_subagent_events_split_from_main_and_time_ordered(self):
+        with tempfile.TemporaryDirectory() as d:
+            agent = ow.ClaudeAgent("a", {"name": "A", "provider": "claude", "workspacePath": "/w"})
+            agent.projdir = d
+            sub = os.path.join(d, "s1", "subagents")
+            os.makedirs(sub)
+            now = time.time()
+            iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t))
+            with open(os.path.join(d, "s1.jsonl"), "w") as f:
+                f.write(json.dumps({"type": "assistant", "timestamp": iso(now - 30), "message": {"content": [
+                    {"type": "text", "text": "main first"}]}}) + "\n")
+                f.write(json.dumps({"type": "assistant", "timestamp": iso(now - 10), "message": {"content": [
+                    {"type": "text", "text": "main last"}]}}) + "\n")
+            path = os.path.join(sub, "agent-x.jsonl")
+            with open(path, "w") as f:
+                f.write(json.dumps({"type": "assistant", "isSidechain": True, "timestamp": iso(now - 20),
+                                    "message": {"content": [{"type": "text", "text": "sub work"}]}}) + "\n")
+            with open(os.path.join(sub, "agent-x.meta.json"), "w") as f:
+                json.dump({"description": "Map the code", "agentType": "Explore"}, f)
+            feed = agent.make_feed()
+            feed.poll()
+            self.assertEqual([r[3] for r in feed.rows(False)], ["main first", "sub work", "main last"])
+            self.assertEqual([r[3] for r in feed.rows(False, main_only=True)], ["main first", "main last"])
+            self.assertEqual([r[3] for r in feed.rows(False, src=path)], ["sub work"])
+            self.assertEqual([(os.path.basename(x["key"]), x["label"], x["kind"]) for x in agent.subagents()],
+                             [("agent-x.jsonl", "Map the code", "Explore")])
+            view = ow.View(agent)
+            view.poll()
+            view.refresh({})
+            tab = view.tabs[path]
+            self.assertTrue(tab.alive)
+            self.assertEqual((tab.label, tab.kind), ("Map the code", "Explore"))
+
+
 class OpencodeFeed(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -141,12 +176,14 @@ class OpencodeFeed(unittest.TestCase):
         ow.OC_DB, ow.OcDB.conn = os.path.join(self.tmp.name, "opencode.db"), None
         db = sqlite3.connect(ow.OC_DB)
         db.execute("create table project (id text, worktree text)")
-        db.execute("create table session_v2 (id text, project_id text, parent_id text, directory text, time_updated integer)")
+        db.execute("create table session_v2 (id text, project_id text, parent_id text, directory text, time_updated integer, "
+                   "title text, agent text, time_created integer, time_busy integer, time_idle integer)")
         db.execute("create table session_message (id text, session_id text, type text, seq integer, "
                    "time_created integer, time_updated integer, data text)")
         now = int(time.time() * 1000)
-        db.execute("insert into session_v2 values ('ses_1', 'p', null, '/w', ?)", (now,))
-        db.execute("insert into session_v2 values ('ses_2', 'p', 'ses_1', '/elsewhere', ?)", (now,))   # subagent
+        db.execute("insert into session_v2 values ('ses_1', 'p', null, '/w', ?, 'Main', 'build', ?, ?, null)", (now, now, now))
+        db.execute("insert into session_v2 values ('ses_2', 'p', 'ses_1', '/elsewhere', ?, 'Find the tests', 'explore', ?, ?, null)",
+                   (now, now, now))   # a subagent, still busy
         msgs = [
             ("m1", "user", {"text": "<openbot-developer-instructions>x</openbot-developer-instructions>\nhello"}),
             ("m2", "assistant", {"time": {"created": now, "completed": now + 1}, "content": [
@@ -164,6 +201,8 @@ class OpencodeFeed(unittest.TestCase):
         for i, (mid, kind, data) in enumerate(msgs):
             db.execute("insert into session_message values (?, 'ses_1', ?, ?, ?, ?, ?)",
                        (mid, kind, i, now + i, now + i, json.dumps(data)))
+        db.execute("insert into session_message values ('s1', 'ses_2', 'assistant', 0, ?, ?, ?)", (now + 5, now + 5, json.dumps(
+            {"time": {"created": now + 5, "completed": now + 6}, "content": [{"type": "text", "text": "found 3 test files"}]})))
         db.commit()
         db.close()
 
@@ -197,6 +236,18 @@ class OpencodeFeed(unittest.TestCase):
             ow.OC_DATA = old
         self.assertEqual(got, {51, 52})
 
+    def test_subagent_tab(self):
+        agent = ow.OpencodeAgent("a", {"name": "A", "provider": "opencode", "workspacePath": "/w"})
+        self.assertEqual([(x["key"], x["label"], x["kind"], x["finished"]) for x in agent.subagents()],
+                         [("ses_2", "Find the tests", "explore", False)])
+        view = ow.View(agent)
+        view.poll()
+        view.refresh({})
+        tab = view.tabs["ses_2"]
+        self.assertTrue(tab.alive)
+        self.assertEqual(tab.poll(), 1)
+        self.assertEqual([r[3] for r in tab.all_rows()], ["found 3 test files"])
+
     def test_sessions_include_subagents(self):
         agent = ow.OpencodeAgent("a", {"name": "A", "provider": "opencode", "workspacePath": "/w"})
         self.assertEqual(agent.sessions(), {"ses_1", "ses_2"})
@@ -209,7 +260,9 @@ class OpencodeFeed(unittest.TestCase):
         self.assertEqual(kinds[0], ("msg", "hello"))                  # OpenBot's instructions stripped
         self.assertIn(("think", "think first"), kinds)
         self.assertIn(("err", "(no output)"), kinds)                 # exit 1 counts as an error
-        self.assertEqual(kinds[-1], ("say", "done"))
+        self.assertIn(("say", "done"), kinds)
+        self.assertEqual([r[3] for r in feed.rows(False, src="ses_2")], ["found 3 test files"])
+        self.assertNotIn("found 3 test files", [r[3] for r in feed.rows(False, main_only=True)])
         self.assertEqual(feed.bg_shells, {"sh_9"})
         self.assertEqual(feed.shell_cmd["sh_9"], "sleep 99")
         self.assertEqual([r[1] for r in feed.running()], ["waiting for the model"])
