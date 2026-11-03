@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """obwatch - watch one OpenBot agent: its reasoning, its commands, and the live
 output of everything it runs (foreground commands, background jobs, and
-detached processes such as servers writing to log files).
+detached processes such as servers writing to log files). Works with agents on
+the Claude Code and opencode providers (opencode covers local LLMs too).
 
   obwatch                 pick an agent from a list
   obwatch coder           open the agent whose name contains "coder"
@@ -12,13 +13,20 @@ Keys:  Tab/Shift-Tab or <-/->/1-9 switch tabs   Up/Down/PgUp/PgDn/g scroll
        G or End follow   e expand outputs   x / X close tab / all finished tabs
        a agent list      q quit
 """
-__version__ = "0.1.0"
+__version__ = "0.2.1"
 
 import argparse, collections, curses, datetime as dt, glob, json, locale, os, re, sqlite3, sys, tempfile, time
 
 HOME = os.path.expanduser("~")
 PROJECTS = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude"), "projects")
 DB = os.path.join(HOME, ".config/OpenBot/openbot.db")
+SIDEBAR = os.path.join(HOME, ".config/OpenBot/openbot-sidebar-layout-v1.json")
+OC_DATA = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local/share"), "opencode")
+if not os.path.exists(os.path.join(OC_DATA, "opencode.db")):
+    OC_DATA = os.path.join(HOME, ".local/share/opencode")
+OC_DB = os.path.join(OC_DATA, "opencode.db")
+HARNESSES = {"claude", "opencode"}     # programs that run the agent itself
+PAGE = os.sysconf("SC_PAGE_SIZE")
 SHELLS = {"sh", "bash", "zsh", "dash", "nohup", "setsid", "timeout", "env", "stdbuf", "nice", "sudo", "xargs", "time"}
 UTILS = {"sleep", "cat", "tail", "head", "grep", "sed", "awk", "tee", "wc", "sort", "uniq", "cut", "tr", "echo", "printf", "date", "ls", "find", "xargs", "pgrep", "ps"}
 SUBCMD = {"docker", "cargo", "npm", "pnpm", "yarn", "git", "go", "make", "python", "python3", "node", "uv", "pip", "npx", "kubectl"}
@@ -26,14 +34,28 @@ CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")   # control bytes (NULs from trun
 ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[()][A-Z0-9]")
 LOGLIKE = re.compile(r"\.(log|out|output|txt)$")
 TASK_ID = re.compile(r"(?:with ID: |\(task )([a-z0-9]{6,})")
+OPENBOT_TAGS = re.compile(r"<openbot-[\w-]+>.*?</openbot-[\w-]+>\s*", re.S)
+SNAPSHOT_CMD = re.compile(r"eval '(.*)'(?: < /dev/null)? && pwd -P", re.S)   # Claude Code's wrapper around each Bash command
 TICKS = os.sysconf("SC_CLK_TCK")
 KEEP_DONE = 15 * 60      # finished tabs stay this long
 KEEP_GONE = 10           # ...unless their file was deleted (finished foreground commands)
 MAX_DONE = 12            # at most this many finished tabs; oldest are dropped first
+FRAME_MS = 300           # redraw and read new activity this often
+SCAN_EVERY = 1.5         # seconds between process scans
+BACKLOG_HOURS = 48       # Claude Code: replay session files written this recently
+OC_BACKLOG = 200         # opencode: replay this many recent messages
+TOOL_STALE = 11 * 60     # a tool call with no result after this long is no longer shown as running
+MODEL_STALE = 30 * 60    # same for a model turn that never completed
+SAME_START = 3           # seconds: an opencode command and its output file start this close together
+
+
+def read(path, mode="r"):
+    with open(path, mode) as f:
+        return f.read()
 
 
 def boot_time():
-    for line in open("/proc/stat"):
+    for line in read("/proc/stat").splitlines():
         if line.startswith("btime"):
             return int(line.split()[1])
     return 0
@@ -55,34 +77,223 @@ def ago(sec):
 
 # ---------------------------------------------------------------- agents
 
+def ro_db(path):
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+
+
+class OcDB:
+    """Shared read-only connection to opencode's session database."""
+    conn = None
+
+    @classmethod
+    def q(cls, sql, args=()):
+        if not os.path.exists(OC_DB):
+            return []
+        try:
+            if cls.conn is None:
+                cls.conn = ro_db(OC_DB)
+            return cls.conn.execute(sql, tuple(args)).fetchall()
+        except sqlite3.Error:
+            cls.conn = None
+            return []
+
+
+def marks(n):
+    return ",".join("?" * n)
+
+
 class Agent:
+    """An OpenBot agent. Subclasses know where their harness keeps sessions and command output."""
+    kind = "?"
+
     def __init__(self, aid, d):
         self.id, self.name = aid, d.get("name") or aid
         self.title = d.get("title") or ""
         self.provider = d.get("provider") or "?"
-        ws = d.get("workspacePath") or os.path.join(HOME, "OpenBot/Agents", aid)
-        self.projdir = os.path.join(PROJECTS, re.sub(r"[^A-Za-z0-9]", "-", ws))
+        self.workspace = d.get("workspacePath") or os.path.join(HOME, "OpenBot/Agents", aid)
+        self.projdir = os.path.join(PROJECTS, re.sub(r"[^A-Za-z0-9]", "-", self.workspace))
+        self._written = (0, 0)
+
+    @property
+    def supported(self):
+        return False
+
+    def sessions(self):
+        return set()
+
+    def _last_write(self):
+        return 0
+
+    def last_write(self):
+        """When the agent's session last changed. Cached briefly: the header asks on every frame."""
+        if time.time() - self._written[0] > 1:
+            self._written = (time.time(), self._last_write())
+        return self._written[1]
+
+    def output_files(self):
+        """Output files of the agent's background and foreground commands."""
+        return []
+
+    def make_feed(self):
+        return None
+
+    def extra_procs(self, procs, keep):
+        """Processes that belong to the agent but can't be found by their session variable."""
+        return []
+
+
+class ClaudeAgent(Agent):
+    kind = "claude"
+    supported = True
 
     def sessions(self):
         return {os.path.basename(p)[:-6] for p in glob.glob(os.path.join(self.projdir, "*.jsonl"))}
 
-    def last_write(self):
-        ts = [os.path.getmtime(p) for p in glob.glob(os.path.join(self.projdir, "**/*.jsonl"), recursive=True)]
+    def _last_write(self):
+        ts = []
+        for p in glob.glob(os.path.join(self.projdir, "**/*.jsonl"), recursive=True):
+            try:
+                ts.append(os.path.getmtime(p))
+            except OSError:
+                pass
         return max(ts, default=0)
+
+    def output_files(self):
+        name = os.path.basename(self.projdir)
+        return glob.glob(f"{tempfile.gettempdir()}/claude-{os.getuid()}/{name}/*/tasks/*.output")
+
+    def make_feed(self):
+        return Feed(self)
+
+
+class OpencodeAgent(Agent):
+    kind = "opencode"
+    supported = True
+
+    def __init__(self, aid, d):
+        super().__init__(aid, d)
+        self.mapped = set()            # session ids that OpenBot recorded for this agent
+        self._cache = (0, set())
+
+    def sessions(self):
+        if time.time() - self._cache[0] < 3:
+            return self._cache[1]
+        ids = {r[0] for r in OcDB.q("select id from session_v2 where directory = ?", (self.workspace,))} | self.mapped
+        frontier = set(ids)
+        while frontier:   # subagent sessions
+            kids = {r[0] for r in OcDB.q(f"select id from session_v2 where parent_id in ({marks(len(frontier))})",
+                                          frontier)} - ids
+            ids |= kids
+            frontier = kids
+        self._cache = (time.time(), ids)
+        return ids
+
+    def _last_write(self):
+        ids = self.sessions()
+        if not ids:
+            return 0
+        r = OcDB.q(f"select max(time_updated) from session_v2 where id in ({marks(len(ids))})", ids)
+        return (r[0][0] or 0) / 1000 if r else 0
+
+    def shell_dirs(self):
+        """opencode writes each shell command's output to shell/<project id>/sh_*.out"""
+        ids = self.sessions()
+        pids = {r[0] for r in OcDB.q("select id from project where worktree = ?", (self.workspace,))}
+        if ids:
+            pids |= {r[0] for r in OcDB.q(f"select project_id from session_v2 where id in ({marks(len(ids))})", ids)}
+        return [os.path.join(OC_DATA, "shell", p) for p in pids if p]
+
+    def output_files(self):
+        return [f for d in self.shell_dirs() for f in glob.glob(os.path.join(d, "sh_*.out"))]
+
+    def command_starts(self, within=KEEP_DONE):
+        """[(time, sh_*.out)] for the agent's recent shell commands: opencode creates the file as it starts one."""
+        now, res = time.time(), []
+        for f in self.output_files():
+            try:
+                c = os.path.getctime(f)
+            except OSError:
+                continue
+            if now - c < within:
+                res.append((c, f))
+        return res
+
+    def extra_procs(self, procs, keep):
+        """Commands opencode started for this agent that lost OPENCODE_SESSION_ID (e.g. `env -i ...`):
+        direct children of opencode that started together with one of the agent's sh_*.out files.
+        Commands can run for hours, so all of the agent's output files count here."""
+        starts = [c for c, _ in self.command_starts(within=float("inf"))]
+        res = []
+        for p in procs.values():
+            par = procs.get(p["ppid"])
+            if (p["pid"] not in keep and not p["sid"] and par and base(par) == "opencode"
+                    and any(abs(c - p["start"]) < SAME_START for c in starts)):
+                res.append(p)
+        return res
+
+    def make_feed(self):
+        return OcFeed(self)
+
+
+AGENT_KINDS = {"claude": ClaudeAgent, "opencode": OpencodeAgent}
+
+
+def make_agent(aid, d):
+    return AGENT_KINDS.get(d.get("provider"), Agent)(aid, d)
+
+
+def sidebar_order(agents, layout):
+    """Agents in the order of OpenBot's sidebar: section by section, each in the sidebar's agent order.
+    Agents the layout doesn't mention keep their place after the ones it does."""
+    order = layout.get("agentOrder") or []
+    rank = {aid: i for i, aid in enumerate(order)}
+    assigned = layout.get("agentAssignments") or {}
+    sections = []
+    for sec in layout.get("order") or []:
+        sid = sec.get("id") if isinstance(sec, dict) else sec
+        if sid not in sections:
+            sections.append(sid)
+    for sec in layout.get("sections") or []:
+        sid = sec.get("id") if isinstance(sec, dict) else sec
+        if sid not in sections:
+            sections.append(sid)
+
+    def key(ia):
+        i, a = ia
+        sec = assigned.get(a.id) or "unassigned"
+        pos = sections.index(sec) if sec in sections else len(sections)
+        return (pos, rank.get(a.id, len(order) + i))
+    return [a for _, a in sorted(enumerate(agents), key=key)]
 
 
 def load_agents():
+    rows, threads, sessions = [], [], []
     try:
-        db = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=2)
+        db = ro_db(DB)
         rows = db.execute("select agent_id, agent_json from projection_agents order by sort_order").fetchall()
+        try:
+            threads = db.execute("select thread_id, agent_id from projection_agent_threads").fetchall()
+            sessions = db.execute("select thread_id, external_session_id from projection_provider_sessions "
+                                  "where provider = 'opencode'").fetchall()
+        except sqlite3.Error:
+            pass
         db.close()
     except Exception:
-        rows = []
-    agents = [Agent(aid, json.loads(j)) for aid, j in rows]
+        pass
+    agents = [make_agent(aid, json.loads(j)) for aid, j in rows]
+    owner = {f"openbot-thread-{a.id}": a for a in agents}
+    owner.update({t: a for a in agents for t, aid in threads if aid == a.id})
+    for t, sid in sessions:
+        if t in owner and sid and isinstance(owner[t], OpencodeAgent):
+            owner[t].mapped.add(sid)
+    try:
+        agents = sidebar_order(agents, json.loads(read(SIDEBAR)))
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass   # keep OpenBot's stored order
     known = {a.projdir for a in agents}
     for d in glob.glob(os.path.join(PROJECTS, "*")):   # transcripts without an OpenBot agent
         if d not in known and glob.glob(os.path.join(d, "*.jsonl")):
-            a = Agent(os.path.basename(d), {"name": os.path.basename(d)[-28:], "provider": "claude"})
+            a = ClaudeAgent(os.path.basename(d), {"name": os.path.basename(d)[-28:], "provider": "claude"})
             a.projdir = d
             agents.append(a)
     return agents
@@ -98,17 +309,27 @@ def scan_procs():
         try:
             if os.stat(f"/proc/{d}").st_uid != uid:
                 continue
-            st = open(f"/proc/{d}/stat", "rb").read().decode("utf-8", "replace")
+            st = read(f"/proc/{d}/stat", "rb").decode("utf-8", "replace")
             f = st[st.rindex(")") + 2:].split()
-            cmd = [c.decode("utf-8", "replace") for c in open(f"/proc/{d}/cmdline", "rb").read().split(b"\0") if c]
-            env = open(f"/proc/{d}/environ", "rb").read()
+            cmd = [c.decode("utf-8", "replace") for c in read(f"/proc/{d}/cmdline", "rb").split(b"\0") if c]
+            env = read(f"/proc/{d}/environ", "rb")
         except (OSError, ValueError):
             continue
         if not cmd:
             continue
-        m = re.search(rb"(?:^|\0)CLAUDE_CODE_SESSION_ID=([^\0]+)", env)
+        m = (re.search(rb"(?:^|\0)OPENCODE_SESSION_ID=([^\0]+)", env)
+             or re.search(rb"(?:^|\0)CLAUDE_CODE_SESSION_ID=([^\0]+)", env))
+        try:
+            out = os.readlink(f"/proc/{d}/fd/1")
+        except OSError:
+            out = None
+        try:
+            unit = read(f"/proc/{d}/cgroup").strip().rsplit("/", 1)[-1]
+        except OSError:
+            unit = ""
         procs[int(d)] = dict(pid=int(d), ppid=int(f[1]), cmd=cmd, start=BOOT + int(f[19]) / TICKS,
-                             sid=m.group(1).decode() if m else None)
+                             sid=m.group(1).decode() if m else None, cpu=int(f[11]) + int(f[12]),
+                             rss=int(f[21]) * PAGE, out=out, unit=unit, unbuffered=b"PYTHONUNBUFFERED=" in env)
     return procs
 
 
@@ -116,56 +337,105 @@ def base(p):
     return os.path.basename(p["cmd"][0])
 
 
-def is_claude(p):
-    return base(p) == "claude"
+def is_harness(p):
+    return base(p) in HARNESSES
 
 
 def is_shell(p):
     return base(p) in SHELLS
 
 
-def agent_procs(procs, sessions):
-    """Processes started by the agent's commands (incl. detached ones), minus MCP servers."""
-    keep = []
+def unit_arg(cmd):
+    for i, a in enumerate(cmd):
+        if a.startswith("--unit="):
+            return a[7:]
+        if a in ("--unit", "-u") and i + 1 < len(cmd):
+            return cmd[i + 1]
+    return None
+
+
+def agent_procs(procs, sessions, agent=None):
+    """Processes started by the agent's commands (incl. detached ones), minus MCP servers.
+
+    Programs started through `systemd-run` run outside the agent's process tree and lose its
+    environment; they are found by their systemd unit, or by sharing systemd-run's output pipe."""
+    keep = {}
     for p in procs.values():
-        if p["sid"] not in sessions or is_claude(p):
+        if p["sid"] not in sessions or is_harness(p):
             continue
         q, ok = p, True
         while True:
             par = procs.get(q["ppid"])
             if par is None:
                 break
-            if is_claude(par):
-                ok = is_shell(q)   # Bash tool runs a shell; other direct children are MCP servers
+            if is_harness(par):
+                # The shell tool runs a shell; Claude Code's other direct children are MCP servers.
+                # opencode only marks shell commands, and a shell running one command `exec`s it,
+                # so under opencode the command itself can be the direct child.
+                ok = is_shell(q) or base(par) == "opencode"
                 break
             q = par
         if ok:
-            keep.append(p)
-    return keep
+            keep[p["pid"]] = p
+    if agent is not None:
+        keep.update((p["pid"], p) for p in agent.extra_procs(procs, keep))
+    # Children of the agent's processes are the agent's too, even when they were started with a
+    # cleaned environment (e.g. by a test runner or `systemd-run`) and lost the session variable.
+    kids = collections.defaultdict(list)
+    for p in procs.values():
+        kids[p["ppid"]].append(p)
+    todo = list(keep)
+    while todo:
+        for k in kids.get(todo.pop(), []):
+            if k["pid"] not in keep and not is_harness(k):
+                keep[k["pid"]] = k
+                todo.append(k["pid"])
+    units, pipes = set(), set()
+    for p in keep.values():
+        if base(p) == "systemd-run":
+            u = unit_arg(p["cmd"])
+            if u:
+                units |= {u, u + ".service", u + ".scope"} if "." not in u else {u}
+            elif p["out"] and p["out"].startswith(("pipe:", "socket:")):
+                pipes.add(p["out"])
+    if units or pipes:
+        for p in procs.values():
+            if p["pid"] not in keep and (p["unit"] in units or (p["out"] in pipes and p["ppid"] not in keep)):
+                keep[p["pid"]] = dict(p, via="systemd-run")
+    return list(keep.values())
 
 
-def out_files(pid):
-    res = set()
+def proc_fds(pid):
+    """[(fd, target)] of a process's open files, pipes and sockets."""
     try:
         fds = os.listdir(f"/proc/{pid}/fd")
     except OSError:
-        return res
+        return []
+    res = []
     for fd in fds:
         try:
-            t = os.readlink(f"/proc/{pid}/fd/{fd}")
+            res.append((fd, os.readlink(f"/proc/{pid}/fd/{fd}")))
         except OSError:
-            continue
+            pass
+    return res
+
+
+def fd_writable(pid, fd):
+    """Whether the process opened `fd` for writing (None if unknown)."""
+    try:
+        return bool(int(read(f"/proc/{pid}/fdinfo/{fd}").split("flags:")[1].split()[0], 8) & 3)
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def out_files(pid):
+    """Regular files a process writes to: its stdout/stderr, plus log-like files open for writing."""
+    res = set()
+    for fd, t in proc_fds(pid):
         if not t.startswith("/") or t.startswith(("/dev/", "/proc/", "/sys/")) or t.endswith(" (deleted)"):
             continue
-        if fd in ("1", "2"):
+        if fd in ("1", "2") or (LOGLIKE.search(t) and fd_writable(pid, fd)):
             res.add(t)
-        elif LOGLIKE.search(t):
-            try:
-                flags = int(open(f"/proc/{pid}/fdinfo/{fd}").read().split("flags:")[1].split()[0], 8)
-                if flags & 3:
-                    res.add(t)
-            except (OSError, IndexError, ValueError):
-                pass
     return {t for t in res if os.path.isfile(t)}
 
 
@@ -181,12 +451,61 @@ def proc_label(ps):
     return None
 
 
-def agent_jobs(procs, sessions):
+def agent_jobs(aps):
     by_file = collections.defaultdict(list)
-    for p in agent_procs(procs, sessions):
+    for p in aps:
         for f in out_files(p["pid"]):
             by_file[f].append(p)
     return by_file
+
+
+def harness_writing(procs, dirs):
+    """opencode writes a running command's output to its sh_*.out file itself: find those open files."""
+    res = set()
+    if not dirs:
+        return res
+    for p in procs.values():
+        if base(p) == "opencode":
+            res |= {t for _, t in proc_fds(p["pid"]) if t.endswith(".out") and t.startswith(dirs)}
+    return res
+
+
+def shell_arg(p):
+    c = p["cmd"]
+    return c[c.index("-c") + 1] if is_shell(p) and "-c" in c[:-1] else None
+
+
+def task_id(f):
+    b = os.path.basename(f)
+    if f.endswith(".output") and "/tasks/" in f:
+        return b[:-7]
+    if f.endswith(".out") and b.startswith("sh_"):
+        return b[:-4]
+    return None
+
+
+def started_at(f, ps):
+    if ps:
+        return min(p["start"] for p in ps)
+    try:
+        return os.path.getctime(f)
+    except OSError:
+        return time.time()
+
+
+def pretty_cmd(cmd):
+    s = " ".join(cmd)
+    m = SNAPSHOT_CMD.search(s)
+    if m:
+        s = f"{os.path.basename(cmd[0])} -c {m.group(1)}".replace("'\"'\"'", "'")
+    return s.replace("\n", " ⏎ ").replace("\t", " ")
+
+
+def fmt_mem(n):
+    for unit in ("B", "K", "M", "G"):
+        if n < 1024 or unit == "G":
+            return f"{n:.0f}{unit}" if unit in ("B", "K") else f"{n:.1f}{unit}"
+        n /= 1024
 
 
 # ---------------------------------------------------------------- activity feed
@@ -202,7 +521,7 @@ class Feed:
 
     def poll(self):
         files = glob.glob(os.path.join(self.agent.projdir, "**/*.jsonl"), recursive=True)
-        cutoff = time.time() - 48 * 3600
+        cutoff = time.time() - BACKLOG_HOURS * 3600
         for p in sorted(files, key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0):
             try:
                 size, mtime = os.path.getsize(p), os.path.getmtime(p)
@@ -262,7 +581,7 @@ class Feed:
                 if name == "Bash":
                     self.ev(ts, "cmd", inp.get("command", ""), desc=inp.get("description", ""),
                             bg=bool(inp.get("run_in_background")), side=side)
-                    label = inp.get("description") or inp.get("command", "")[:60]
+                    label = inp.get("description") or short_cmd(inp.get("command", ""))
                 else:
                     self.ev(ts, "tool", tool_detail(name, inp), name=name.split("__")[-1], side=side)
                     label = name.split("__")[-1]
@@ -277,12 +596,13 @@ class Feed:
                 c = (c or "").strip()
                 m = TASK_ID.search(c[:300])
                 if m:
-                    self.task_desc[m.group(1)] = inp.get("description") or name
+                    self.task_desc[m.group(1)] = inp.get("description") or short_cmd(inp.get("command", "")) or name
                 self.ev(ts, "err" if b.get("is_error") else "out", c or "(no output)", name=name, side=side)
 
     def running(self):
+        """(started, label, tool) of tool calls still waiting for their result."""
         now = time.time()
-        return [v for v in self.pending.values() if now - v[0] < 11 * 60]
+        return [v for v in self.pending.values() if now - v[0] < (MODEL_STALE if v[2] == "model" else TOOL_STALE)]
 
     def rows(self, expand):
         """-> list of (ts, tag, style, text)"""
@@ -311,16 +631,132 @@ class Feed:
         return out
 
 
+def unquote(cmd):
+    return re.sub(r"[\"'\s]+", " ", cmd).strip()
+
+
+def short_cmd(cmd, n=60):
+    """A command as a one-line label."""
+    first = cmd.strip().split("\n")[0]
+    return (first[:n] + "…") if len(first) > n or "\n" in cmd.strip() else first
+
+
 def tool_detail(name, inp):
-    if name in ("Read", "Write", "Edit", "NotebookEdit"):
-        return inp.get("file_path", "")
-    if name in ("Grep", "Glob"):
+    n = name.lower()
+    if n in ("read", "write", "edit", "notebookedit", "patch", "list", "multiedit"):
+        return inp.get("file_path") or inp.get("path") or inp.get("filePath") or ""
+    if n in ("grep", "glob"):
         return f"{inp.get('pattern', '')}  {inp.get('path', '')}"
-    if name == "Monitor":
+    if n == "monitor":
         return f"{inp.get('description', '')}\n{inp.get('command', '')}"
-    if name == "Agent":
+    if n in ("agent", "task"):
         return f"{inp.get('description', '')}: {inp.get('prompt', '')}"
+    if n == "execute":          # opencode Code Mode: JavaScript that calls tools
+        return inp.get("code", "")
+    if n == "skill":
+        return inp.get("id") or inp.get("name") or ""
     return json.dumps(inp, ensure_ascii=False)
+
+
+class OcFeed(Feed):
+    """Activity of an opencode agent (any model, local LLMs included), read from opencode's database."""
+
+    def __init__(self, agent):
+        super().__init__(agent)
+        self.since = 0
+        self.done = set()                      # (message id, part index, stage) already shown
+        self.seen = {}                         # message id -> time_updated last parsed
+        self.bg_shells, self.shell_cmd = set(), {}
+
+    def poll(self):
+        sids = self.agent.sessions()
+        if not sids:
+            return
+        sql = (f"select id, type, time_created, time_updated, data from session_message "
+               f"where session_id in ({marks(len(sids))}) and type in ('user', 'assistant', 'synthetic') ")
+        if self.primed:
+            rows = OcDB.q(sql + "and time_updated >= ? order by time_created, seq", [*sids, self.since])
+        else:   # start with the last messages, however old
+            rows = OcDB.q(sql + f"order by time_created desc, seq desc limit {OC_BACKLOG}", sids)[::-1]
+        for mid, typ, created, updated, data in rows:
+            self.since = max(self.since, updated or 0)
+            if self.seen.get(mid) == updated:
+                continue   # unchanged since the last poll
+            self.seen[mid] = updated
+            try:
+                self.add_msg(mid, typ, created or 0, json.loads(data))
+            except (ValueError, AttributeError, TypeError):
+                pass
+        self.primed = True
+
+    @staticmethod
+    def stamp(ms):
+        return time.strftime("%H:%M:%S", time.localtime(ms / 1000)), ms / 1000
+
+    def add_msg(self, mid, typ, created, j):
+        if typ in ("user", "synthetic"):
+            if (mid, 0, "in") not in self.done:
+                self.done.add((mid, 0, "in"))
+                text = OPENBOT_TAGS.sub("", j.get("text") or "").strip()
+                self.ev(self.stamp(created)[0], "msg", text or "(OpenBot instructions)")
+            return
+        mtime = j.get("time") or {}
+        if mtime.get("completed") or j.get("error"):
+            self.pending.pop(mid, None)
+        elif not any(p.get("type") == "tool" and (p.get("state") or {}).get("status") == "running"
+                     for p in j.get("content") or []):
+            self.pending[mid] = (created / 1000, "waiting for the model", "model")   # e.g. a local model still generating
+        else:
+            self.pending.pop(mid, None)
+        last = created
+        for i, part in enumerate(j.get("content") or []):
+            pt, ptime = part.get("type"), part.get("time") or {}
+            last = ptime.get("completed") or ptime.get("created") or last   # text parts carry no time of their own
+            ts, epoch = self.stamp(ptime.get("created") or last)
+            if pt in ("reasoning", "text"):
+                if (mid, i, "t") in self.done or not (mtime.get("completed") or ptime.get("completed")):
+                    continue
+                self.done.add((mid, i, "t"))
+                text = (part.get("text") or "").strip()
+                if text:
+                    self.ev(ts, "think" if pt == "reasoning" else "say", text)
+            elif pt == "tool":
+                self.tool_part(mid, i, part, ts, epoch)
+        err = j.get("error")
+        if err and mtime.get("completed") and (mid, -1, "err") not in self.done:
+            self.done.add((mid, -1, "err"))
+            self.ev(self.stamp(mtime["completed"])[0], "err", f"{err.get('type', 'error')}: {err.get('message', '')}")
+
+    def tool_part(self, mid, i, part, ts, epoch):
+        name, st = part.get("name", "?"), part.get("state") or {}
+        inp, status, meta = st.get("input") or {}, st.get("status"), st.get("metadata") or {}
+        shell = name in ("shell", "bash")
+        key = part.get("id") or f"{mid}:{i}"
+        if meta.get("shellID"):
+            sh = meta["shellID"]
+            self.task_desc[sh] = inp.get("description") or short_cmd(inp.get("command", ""))
+            self.shell_cmd[sh] = inp.get("command", "")
+            if inp.get("background"):
+                self.bg_shells.add(sh)
+        if (mid, i, "use") not in self.done and (inp or status in ("running", "completed", "error")):
+            self.done.add((mid, i, "use"))
+            if shell:
+                self.ev(ts, "cmd", inp.get("command", ""), desc=inp.get("description", ""), bg=bool(inp.get("background")))
+                self.pending[key] = (epoch, inp.get("description") or short_cmd(inp.get("command", "")), "Bash")
+            else:
+                self.ev(ts, "tool", tool_detail(name, inp), name=name)
+                self.pending[key] = (epoch, name, name)
+        if status in ("completed", "error") and (mid, i, "res") not in self.done:
+            self.done.add((mid, i, "res"))
+            self.pending.pop(key, None)
+            c = st.get("content")
+            if isinstance(c, list):
+                c = "\n".join(x.get("text", f"[{x.get('type')}]") for x in c if isinstance(x, dict))
+            c = c or st.get("output") or st.get("error") or ""
+            c = (c if isinstance(c, str) else json.dumps(c, ensure_ascii=False)).strip()
+            done_ts = self.stamp((part.get("time") or {}).get("completed") or epoch * 1000)[0]
+            failed = status == "error" or meta.get("exit") not in (None, 0)
+            self.ev(done_ts, "err" if failed else "out", c or "(no output)", name="Bash" if shell else name)
 
 
 def clip(text, n):
@@ -376,13 +812,118 @@ class LogTab:
         return r
 
 
+PROC_HINT = ("Output that goes to a pipe or socket is read by another program, so obwatch can't show it. "
+             "Send it to a file (e.g. `cmd 2>&1 | tee run.log`) to get a live tab.")
+
+
+def pipe_readers(inodes, procs):
+    """pipe:[n] -> processes that hold its read end."""
+    res = collections.defaultdict(list)
+    if not inodes:
+        return res
+    for p in procs.values():
+        for fd, t in proc_fds(p["pid"]):
+            if t in inodes and fd_writable(p["pid"], fd) is False and p not in res[t]:
+                res[t].append(p)
+    return res
+
+
+class ProcTab:
+    """Every process the agent started, as a tree: CPU, memory, and where its output goes."""
+    path = "__procs__"
+
+    def __init__(self):
+        self.label, self.pinned, self.alive = "Processes", True, True
+        self.unread, self.bottom, self.pos = 0, None, 0
+        self.started = self.ended = None
+        self.pids, self.rows, self.prev, self.summary = [], [], {}, ""
+
+    def poll(self):
+        return 0
+
+    def all_rows(self):
+        return self.rows
+
+    def cpu(self, p, now):
+        prev = self.prev.get(p["pid"])
+        self.prev[p["pid"]] = (p["cpu"], now, p["start"])
+        if prev and prev[2] == p["start"] and now > prev[1]:
+            return (p["cpu"] - prev[0]) / TICKS / (now - prev[1]) * 100
+        return p["cpu"] / TICKS / max(now - p["start"], 1) * 100
+
+    def describe_out(self, p, procs, readers, tabs):
+        o = p["out"]
+        if not o:
+            return "no output"
+        if o.startswith(("/dev/pts", "/dev/tty")):
+            return "terminal"
+        if o == "/dev/null":
+            return "discarded (/dev/null)"
+        if o.startswith("pipe:"):
+            r = [q for q in readers.get(o, []) if q["pid"] != p["pid"]]
+            if any(is_harness(q) for q in r):
+                return f"captured by {base([q for q in r if is_harness(q)][0])}: shown in the command's tab and in Activity"
+            if r:
+                return "pipe -> read by " + ", ".join(f"{base(q)} ({q['pid']})" for q in r[:3]) + "  (not shown)"
+            return "pipe -> another program (not shown)"
+        if o.startswith("socket:"):
+            par = procs.get(p["ppid"])
+            if par and is_harness(par):
+                return f"captured by {base(par)}: shown in the command's tab and in Activity"
+            return f"socket -> probably read by {base(par)} ({par['pid']})  (not shown)" if par else "socket (not shown)"
+        if o.endswith(" (deleted)"):
+            return "deleted file " + o[:-10]
+        if not o.startswith("/"):
+            return o
+        note = "  [has a tab]" if o in tabs else ""
+        if base(p).startswith("python") and "-u" not in p["cmd"][1:3] and not p["unbuffered"]:
+            note += "  · Python buffers file output: it arrives in chunks (use python -u)"
+        return "file " + o + note
+
+    def update(self, aps, procs, tabs, deep):
+        now = time.time()
+        byid = {p["pid"]: p for p in aps}
+        kids, roots = collections.defaultdict(list), []
+        for p in aps:
+            (kids[p["ppid"]] if p["ppid"] in byid else roots).append(p)
+        readers = pipe_readers({p["out"] for p in aps if p["out"] and p["out"].startswith("pipe:")}, procs) if deep else {}
+        rows = [("dim", PROC_HINT), ("head", f"{'PID':>7} {'CPU':>5} {'MEM':>7} {'TIME':>6}  COMMAND")]
+        total_cpu = total_mem = 0
+
+        def walk(p, depth, parent_out):
+            nonlocal total_cpu, total_mem
+            c = self.cpu(p, now)
+            total_cpu += c
+            total_mem += p["rss"]
+            via = "[systemd-run] " if p.get("via") else ""
+            rows.append(("cmd" if depth == 0 else "out",
+                         f"{p['pid']:>7} {c:>4.0f}% {fmt_mem(p['rss']):>7} {ago(now - p['start']):>6}  "
+                         f"{'  ' * depth}{via}{pretty_cmd(p['cmd'])}"))
+            if p["out"] != parent_out and deep:
+                rows.append(("dim", " " * 30 + "  " * depth + "↳ output: " + self.describe_out(p, procs, readers, tabs)))
+            for k in sorted(kids[p["pid"]], key=lambda q: q["start"]):
+                walk(k, depth + 1, p["out"])
+
+        for r in sorted(roots, key=lambda q: q["start"]):
+            walk(r, 0, None)
+        if not aps:
+            rows.append(("dim", "        (no processes running)"))
+        self.prev = {k: v for k, v in self.prev.items() if k in byid}
+        self.rows, self.pids = rows, sorted(byid)
+        self.label = f"Processes {len(aps)}" if aps else "Processes"
+        cores = f" (≈{total_cpu / 100:.0f} cores)" if total_cpu >= 150 else ""
+        self.summary = (f" {len(aps)} process{'es' if len(aps) != 1 else ''} · CPU {total_cpu:.0f}%{cores}"
+                        f" · memory {fmt_mem(total_mem)}")
+
+
 class View:
-    """One agent: Activity tab + one tab per output file of its running/finished commands."""
+    """One agent: Activity tab, Processes tab, and a tab per output file of its running/finished commands."""
 
     def __init__(self, agent, pinned=()):
         self.agent = agent
-        self.feed = Feed(agent)
+        self.feed = agent.make_feed()
         self.tabs = collections.OrderedDict()
+        self.ptab = self.tabs[ProcTab.path] = ProcTab()
         for p in pinned:
             self.tabs[p] = LogTab(p, os.path.basename(p), pinned=True)
         self.sel = None          # path of the selected tab, None = Activity
@@ -391,67 +932,108 @@ class View:
         self.expand = False
         self.rows_cache, self.rows_key = [], None
 
-    def tasks_dirs(self):
-        name = os.path.basename(self.agent.projdir)
-        return glob.glob(f"{tempfile.gettempdir()}/claude-{os.getuid()}/{name}/*/tasks/*.output")
+    def oc_shell_procs(self, f, aps, procs):
+        """Processes of the opencode shell command whose output goes to `f`: matched by command line,
+        or as the harness's child that started when the file was created."""
+        cmd = self.feed.shell_cmd.get(task_id(f))
+        try:
+            born = os.path.getctime(f)
+        except OSError:
+            born = 0
+        res = []
+        for p in aps:
+            par = procs.get(p["ppid"])
+            if (cmd and cmd in (shell_arg(p), " ".join(p["cmd"]))) or \
+                    (par and is_harness(par) and abs(p["start"] - born) < SAME_START):
+                res.append(p)
+        return res
+
+    def is_foreground(self, f):
+        """opencode keeps every command's output file; only background ones stay as tabs after they end."""
+        tid = task_id(f)
+        return self.agent.kind == "opencode" and tid is not None and tid not in self.feed.bg_shells
 
     def refresh(self, procs):
         now = time.time()
-        jobs = agent_jobs(procs, self.agent.sessions())
+        aps = agent_procs(procs, self.agent.sessions(), self.agent)
+        jobs = agent_jobs(aps)
+        if self.agent.kind == "opencode":
+            dirs = tuple(d + os.sep for d in self.agent.shell_dirs())
+            for f in harness_writing(procs, dirs):
+                jobs.setdefault(f, self.oc_shell_procs(f, aps, procs))
+        self.ptab.update(aps, procs, set(jobs), deep=self.sel == ProcTab.path)
         for f, ps in list(jobs.items()):
             if f in self.dismissed:
-                if min(p["start"] for p in ps) > self.dismissed[f]:
+                if started_at(f, ps) > self.dismissed[f]:
                     del self.dismissed[f]   # something new started writing here: show it again
                 else:
                     del jobs[f]
-        for f in self.tasks_dirs():   # finished background tasks
-            if f not in jobs and f not in self.tabs and f not in self.dismissed and now - os.path.getmtime(f) < KEEP_DONE and os.path.getsize(f):
+        for f in self.agent.output_files():   # finished background tasks
+            try:
+                fresh = now - os.path.getmtime(f) < KEEP_DONE and os.path.getsize(f)
+            except OSError:
+                continue
+            if fresh and f not in jobs and f not in self.tabs and f not in self.dismissed and not self.is_foreground(f):
                 t = self.tabs[f] = LogTab(f, self.label_for(f, []))
                 t.ended = os.path.getmtime(f)
         owner = {}   # pid -> task output file its shell writes to
         for f, ps in jobs.items():
-            if f.endswith(".output") and "/tasks/" in f:
+            if task_id(f):
                 for p in ps:
                     owner[p["pid"]] = f
+        if self.agent.kind == "opencode":
+            # a command that sends its output elsewhere leaves its sh_*.out unopened: link them by start time
+            born = self.agent.command_starts(within=float("inf"))
+            for p in aps:
+                par = procs.get(p["ppid"])
+                if p["pid"] not in owner and par and is_harness(par):
+                    hit = [f for c, f in born if abs(c - p["start"]) < SAME_START]
+                    if hit:   # several commands can start at once: prefer the one whose text matches
+                        me = unquote(" ".join(p["cmd"]))
+                        owner[p["pid"]] = max(hit, key=lambda f: (
+                            me in unquote(self.feed.shell_cmd.get(task_id(f), "")), task_id(f) in self.feed.bg_shells))
 
-        def task_of(ps):
+        def task_of(ps, f=None):
+            """The task output file that the shell running `ps` writes to, other than `f` itself."""
             for p in ps:
-                q = procs.get(p["ppid"])
+                q = p
                 while q:
-                    if q["pid"] in owner:
+                    if owner.get(q["pid"], f) != f:
                         return owner[q["pid"]]
                     q = procs.get(q["ppid"])
             return None
 
-        parents = {task_of(ps) for f, ps in jobs.items()} - {None}
+        parents = {task_of(ps, f) for f, ps in jobs.items()} - {None}
         for f in list(jobs):   # a silent task shell whose child writes its own log: show only the log
             if f in parents and not os.path.getsize(f) and f not in self.tabs:
                 del jobs[f]
         for f, ps in jobs.items():
             t = self.tabs.get(f)
             if t is None:
-                t = self.tabs[f] = LogTab(f, self.label_for(f, ps, task_of(ps)))
+                t = self.tabs[f] = LogTab(f, self.label_for(f, ps, task_of(ps, f)))
             if not t.alive and not t.pinned:
-                t.label = self.label_for(f, ps, task_of(ps))
+                t.label = self.label_for(f, ps, task_of(ps, f))
             t.alive, t.ended = True, None
             t.pids = sorted(p["pid"] for p in ps)
-            t.started = min(p["start"] for p in ps)
+            t.started = started_at(f, ps)
         for f, t in list(self.tabs.items()):
+            if t is self.ptab:
+                continue
             if f not in jobs and t.alive:
                 t.alive, t.ended = False, now
             if t.alive or t.pinned or f == self.sel:
                 continue
-            gone = not os.path.exists(f)
-            if t.ended and now - t.ended > (KEEP_GONE if gone else KEEP_DONE):
+            short = not os.path.exists(f) or self.is_foreground(f)
+            if t.ended and now - t.ended > (KEEP_GONE if short else KEEP_DONE):
                 del self.tabs[f]
         done = [t for t in self.ordered() if not t.alive and not t.pinned and t.path != self.sel]
         for t in done[MAX_DONE:]:
             del self.tabs[t.path]
 
     def ordered(self):
-        """Pinned tabs, then running (oldest first), then finished (most recent first)."""
-        tabs = list(self.tabs.values())
-        pinned = [t for t in tabs if t.pinned]
+        """Processes, pinned tabs, then running (oldest first), then finished (most recent first)."""
+        tabs = [t for t in self.tabs.values() if t is not self.ptab]
+        pinned = [self.ptab] + [t for t in tabs if t.pinned]
         running = sorted((t for t in tabs if t.alive and not t.pinned), key=lambda t: t.started or 0)
         done = sorted((t for t in tabs if not t.alive and not t.pinned), key=lambda t: -(t.ended or 0))
         return pinned + running + done
@@ -468,9 +1050,9 @@ class View:
             self.sel = keys[index]
 
     def label_for(self, f, ps, parent_task=None):
-        tid = os.path.basename(f)[:-7] if f.endswith(".output") and "/tasks/" in f else None
+        tid = task_id(f)
         if not tid and parent_task:
-            ptid = os.path.basename(parent_task)[:-7]
+            ptid = task_id(parent_task)
             if ptid in self.feed.task_desc:
                 return self.feed.task_desc[ptid]
         if tid and tid in self.feed.task_desc:
@@ -495,6 +1077,8 @@ class View:
 
     def close(self, t):
         """Hide a tab (the process keeps running) until something new writes to its file."""
+        if t is self.ptab:
+            return
         self.dismissed[t.path] = time.time()
         self.tabs.pop(t.path, None)
 
@@ -511,7 +1095,7 @@ class View:
         return self.rows_cache
 
     def running_count(self):
-        return sum(1 for t in self.tabs.values() if t.alive)
+        return sum(1 for t in self.tabs.values() if t.alive and t is not self.ptab)
 
 
 # ---------------------------------------------------------------- drawing
@@ -532,6 +1116,7 @@ def init_colors():
     for i, (k, (fg, attr)) in enumerate(spec.items(), 1):
         curses.init_pair(i, fg, bg)
         STYLES[k] = curses.color_pair(i) | attr
+    STYLES["head"] = curses.A_BOLD | curses.A_UNDERLINE
     curses.init_pair(20, curses.COLOR_BLACK, curses.COLOR_CYAN)
     STYLES["tabsel"] = curses.color_pair(20) | curses.A_BOLD
     curses.init_pair(21, curses.COLOR_BLACK, curses.COLOR_WHITE)
@@ -542,7 +1127,8 @@ def put(win, y, x, text, attr=0):
     h, w = win.getmaxyx()
     if y >= h or x >= w:
         return x
-    text = CTRL.sub("", text)[: max(w - x - (1 if y == h - 1 else 0), 0)]
+    # never write into the last column: terminals differ in how they wrap there
+    text = CTRL.sub("", text.replace("\t", "    "))[: max(w - x - 1, 0)]
     try:
         win.addstr(y, x, text, attr)
     except (curses.error, ValueError):
@@ -579,16 +1165,33 @@ def log_lines(row, width):
     return [[(style, l)] for l in wrap(row, width)]
 
 
-def draw_body(win, top, height, width, rows, bottom, render):
-    """Render logical rows so that row `bottom` (None = last) ends at the bottom of the area."""
+def proc_lines(row, width, expand=False):
+    style, text = row
+    if style == "dim" and text == PROC_HINT or expand:
+        return [[(STYLES[style], l)] for l in wrap(text, width)]
+    return [[(STYLES[style], text)]]
+
+
+def draw_body(win, top, height, width, rows, bottom, render, from_top=False):
+    """Render logical rows so that row `bottom` (None = last) ends at the bottom of the area.
+    With `from_top`, bottom=None shows the first rows instead (for tables rather than logs)."""
     if not rows:
         put(win, top, 1, "(nothing yet)", STYLES["dim"])
         return
-    end = len(rows) - 1 if bottom is None else max(0, min(bottom, len(rows) - 1))
-    lines, i = [], end
-    while i >= 0 and len(lines) < height:
-        lines[0:0] = render(rows[i], width)
-        i -= 1
+    width -= 1   # put() leaves the last column empty
+    lines = []
+    if from_top and bottom is None:
+        for r in rows:
+            lines += render(r, width)
+            if len(lines) >= height:
+                break
+        lines = lines[:height]
+    else:
+        end = len(rows) - 1 if bottom is None else max(0, min(bottom, len(rows) - 1))
+        i = end
+        while i >= 0 and len(lines) < height:
+            lines[0:0] = render(rows[i], width)
+            i -= 1
     for y, segs in enumerate(lines[-height:]):
         x = 0
         for attr, s in segs:
@@ -600,11 +1203,11 @@ def draw_view(win, v):
     win.erase()
     now = time.time()
     age = now - v.agent.last_write()
-    state = "working" if age < 20 else f"idle {ago(age)}"
     running = v.feed.running()
-    ndone = len(v.tabs) - v.running_count()
+    state = "working" if age < 20 or running else f"idle {ago(age)}"
+    ndone = len(v.tabs) - 1 - v.running_count()
     hdr = f" {v.agent.name} · {state} · {v.running_count()} running · {ndone} finished"
-    if running and age < 11 * 60:
+    if running:
         hdr += f" · now: {running[-1][1]} ({ago(now - running[-1][0])})"
     put(win, 0, 0, hdr.ljust(w), STYLES["bar"])
 
@@ -612,7 +1215,7 @@ def draw_view(win, v):
     order = v.ordered()
     items = [(None, "1 Activity" + (f" +{v.act_unread}" if v.act_unread else ""))]
     for i, t in enumerate(order, 2):
-        mark = "≡" if t.pinned else "●" if t.alive else "✓"
+        mark = "⚙" if t is v.ptab else "≡" if t.pinned else "●" if t.alive else "✓"
         lab = t.label if len(t.label) <= 26 else t.label[:25] + "…"
         unread = f" +{t.unread}" if 0 < t.unread < 1000 else " +999" if t.unread else ""
         items.append((t, f"{i if i <= 9 else ''} {mark} {lab}".strip() + unread))
@@ -636,7 +1239,7 @@ def draw_view(win, v):
         t, lab, sep = cells[i]
         if i > lo or lo:
             x = put(win, 1, x, sep, STYLES["warn"] if sep == "┃" else STYLES["dim"])
-        st = STYLES["tabsel"] if i == sel_i else (STYLES["ok"] if t and t.alive else STYLES["dim"] if t else 0)
+        st = STYLES["tabsel"] if i == sel_i else (0 if t is None or t is v.ptab else STYLES["ok"] if t.alive else STYLES["dim"])
         x = put(win, 1, x, lab, st)
     if hi < len(cells) - 1:
         put(win, 1, x, f" {len(cells) - 1 - hi}»", STYLES["dim"])
@@ -646,16 +1249,22 @@ def draw_view(win, v):
     if t is None:
         follow = v.act_bottom is None
         draw_body(win, top, bottom_row - top, w, v.act_rows(), v.act_bottom, act_lines)
+    elif t is v.ptab:
+        put(win, 2, 0, t.summary.ljust(w), STYLES["dim"] | curses.A_REVERSE)
+        follow = t.bottom is None
+        draw_body(win, 3, bottom_row - 3, w, t.all_rows(), t.bottom, lambda r, wd: proc_lines(r, wd, v.expand),
+                  from_top=True)
     else:
         if t.alive:
-            info = f" running {ago(now - t.started)} · pid {','.join(map(str, t.pids[:4]))} · {t.path}"
+            pids = f" · pid {','.join(map(str, t.pids[:4]))}" if t.pids else ""
+            info = f" running {ago(now - t.started)}{pids} · {t.path}"
         else:
             info = f" finished {ago(now - (t.ended or now))} ago · {t.path}"
         put(win, 2, 0, info.ljust(w), STYLES["dim"] | curses.A_REVERSE)
         follow = t.bottom is None
         draw_body(win, 3, bottom_row - 3, w, t.all_rows(), t.bottom, log_lines)
     foot = " ←/→ tabs  ↑/↓ PgUp/PgDn scroll  G follow  e expand  x close tab  X close finished  a agents  q quit "
-    mode = " FOLLOW " if follow else " PAUSED (G to follow) "
+    mode = (" LIVE " if t is v.ptab else " FOLLOW ") if follow else " PAUSED (G to follow) "
     put(win, h - 1, 0, foot.ljust(w - len(mode))[: w - len(mode)], STYLES["bar"])
     put(win, h - 1, max(w - len(mode) - 1, 0), mode, STYLES["tabsel"] if follow else STYLES["err"] | curses.A_REVERSE)
     win.refresh()
@@ -668,14 +1277,14 @@ def draw_picker(win, agents, sel, stats):
     now = time.time()
     for i, a in enumerate(agents):
         lw, live = stats.get(a.projdir, (0, 0))
-        if a.provider != "claude":
+        if not a.supported:
             st = f"{a.provider}: not supported"
         elif not lw:
             st = "no sessions yet"
         else:
-            st = ("working" if now - lw < 20 else f"idle {ago(now - lw)}") + (f" · {live} running" if live else "")
-        line = f" {'›' if i == sel else ' '} {a.name:<24.24} {st}"
-        attr = STYLES["tabsel"] if i == sel else (STYLES["dim"] if a.provider != "claude" else 0)
+            st = ("working" if now - lw < 20 else f"idle {ago(now - lw)}") + (f" · {live} process{'es' if live != 1 else ''}" if live else "")
+        line = f" {'›' if i == sel else ' '} {a.name:<24.24} {a.provider:<9.9} {st}"
+        attr = STYLES["tabsel"] if i == sel else (STYLES["dim"] if not a.supported else 0)
         put(win, 2 + i, 0, line.ljust(w), attr)
     win.refresh()
 
@@ -685,22 +1294,27 @@ def draw_picker(win, agents, sel, stats):
 def tui(stdscr, args, agents, start):
     curses.curs_set(0)
     init_colors()
-    stdscr.timeout(300)
+    stdscr.timeout(FRAME_MS)
     views, view = {}, None
     sel = 0
     if start is not None:
         view = views[start.projdir] = View(start, args.follow)
         view.poll()
-    procs, last_scan, stats = {}, 0, {}
+    procs, last_scan, stats, last_shown = {}, 0, {}, None
     while True:
         now = time.time()
-        if now - last_scan > 1.5:
+        if now - last_scan > SCAN_EVERY:
             procs, last_scan = scan_procs(), now
             if view:
                 view.refresh(procs)
             else:
-                stats = {a.projdir: (a.last_write(), sum(1 for f in agent_jobs(procs, a.sessions()) if os.path.getsize(f)))
+                stats = {a.projdir: (a.last_write(), len({p["pid"] for p in agent_procs(procs, a.sessions(), a)
+                                                           if not is_shell(p) and base(p) not in UTILS}))
                          for a in agents}
+        shown = (id(view), view.sel if view else None, view.expand if view else None)
+        if shown != last_shown:   # repaint fully when the screen changes, so nothing stale is left
+            stdscr.clear()
+            last_shown = shown
         if view:
             view.poll()
             draw_view(stdscr, view)
@@ -716,7 +1330,7 @@ def tui(stdscr, args, agents, start):
                 sel = max(sel - 1, 0)
             elif k in (curses.KEY_DOWN, ord("j")):
                 sel = min(sel + 1, len(agents) - 1)
-            elif k in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT):
+            elif k in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT) and agents[sel].supported:
                 a = agents[sel]
                 view = views.get(a.projdir) or views.setdefault(a.projdir, View(a, args.follow))
                 view.poll()
@@ -726,7 +1340,8 @@ def tui(stdscr, args, agents, start):
         page = max(stdscr.getmaxyx()[0] // 2, 1)
         rows_len = len(view.act_rows()) if t is None else len(t.all_rows())
         cur = (view.act_bottom if t is None else t.bottom)
-        cur = rows_len - 1 if cur is None else cur
+        if cur is None:   # the Processes table starts at the top; everything else at the end
+            cur = min(rows_len - 1, stdscr.getmaxyx()[0] - 5) if t is view.ptab else rows_len - 1
         newb = "same"
         if k in (ord("a"), 27):
             view = None
@@ -751,6 +1366,7 @@ def tui(stdscr, args, agents, start):
             newb = None
         elif k == ord("e"):
             view.expand = not view.expand
+            last_scan = 0
             view.act_bottom = None
         elif k == ord("x") and t is not None:
             view.select(step=-1)
@@ -778,7 +1394,7 @@ def tui(stdscr, args, agents, start):
 def plain(agent):
     colors = dict(say="\033[36m", think="\033[35m", cmd="\033[1;33m", msg="\033[32m", err="\033[31m",
                   tool="\033[1;34m", out="", dim="\033[2m")
-    feed, shown = Feed(agent), 0
+    feed, shown = agent.make_feed(), 0
     try:
         while True:
             feed.poll()
@@ -808,11 +1424,15 @@ def main():
     agents = load_agents()
     start = None
     if args.agent:
-        hits = [a for a in agents if args.agent.lower() in (a.name + " " + a.id).lower()]
+        q = args.agent.lower()
+        hits = [a for a in agents if a.name.lower() == q or a.id.lower() == q] or \
+            [a for a in agents if q in (a.name + " " + a.id).lower()]   # an exact name wins over partial matches
         if len(hits) != 1:
             names = ", ".join(a.name for a in hits) if hits else ", ".join(a.name for a in agents)
             sys.exit(f"{'Several' if hits else 'No'} agents match '{args.agent}': {names}")
         start = hits[0]
+        if not start.supported:
+            sys.exit(f"{start.name} runs on the {start.provider} provider, which obwatch doesn't support yet.")
     if args.plain:
         if not start:
             sys.exit("--plain needs an agent name")

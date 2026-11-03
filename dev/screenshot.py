@@ -31,8 +31,10 @@ graphics.TEXT[22] = "-italics"
 
 SHOTS = [  # (file name, keys to press first, settle seconds, rows to keep)
     ("activity.png", "", 3, ROWS),
-    ("log-tab.png", "2", 4, ROWS),
-    ("agents.png", "a", 2, 7),
+    ("processes.png", "2", 4, 14),
+    ("log-tab.png", "3", 4, ROWS),
+    ("agents.png", "a", 2, 8),
+    ("opencode.png", "jj\r", 4, ROWS),
 ]
 
 

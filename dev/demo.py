@@ -23,8 +23,26 @@ AGENTS = [
                           "workspacePath": WORKSPACE}),
     ("agent-demo-research", {"name": "Researcher", "title": "Reads docs and compares options", "provider": "claude",
                              "workspacePath": "/home/demo/OpenBot/Agents/agent-demo-research"}),
-    ("agent-demo-writer", {"name": "Writer", "title": "Drafts posts", "provider": "opencode"}),
+    ("agent-demo-local", {"name": "Local model", "title": "opencode + a model served on the LAN",
+                          "provider": "opencode", "workspacePath": "/home/demo/OpenBot/Agents/agent-demo-local"}),
+    ("agent-demo-writer", {"name": "Writer", "title": "Drafts posts", "provider": "codex"}),
 ]
+
+# The opencode agent: its session lives in opencode's database; shell output goes to shell/<project>/sh_*.out
+OC_WS = "/home/demo/OpenBot/Agents/agent-demo-local"
+OC_DIR = f"{HOME}/.local/share/opencode"
+OC_SESSION, OC_PROJECT, OC_SHELL = "ses_demo0local0agent01", "demoproject0local0001", "sh_demo0bench0000001"
+BENCH = r'''
+import random, time
+print("bench: 50 rounds of 200 lookups, cache ttl=600s", flush=True)
+for i in range(1, 51):
+    hit = min(97, 40 + i * 3) + random.random()
+    print(f"round {i:2d}/50  p50={random.uniform(0.2, 0.6) if i > 1 else 180:.1f}ms  "
+          f"p99={random.uniform(2, 9) if i > 1 else 420:.1f}ms  cache hits={hit:.1f}%", flush=True)
+    time.sleep(1.5)
+print("bench done", flush=True)
+'''
+RELAY = "import sys\nfor line in sys.stdin:\n    sys.stdout.write(line); sys.stdout.flush()"
 
 # Programs the demo "agent" left running. Each writes slowly to its output file.
 API_SERVER = r'''
@@ -126,18 +144,92 @@ def transcript():
     return recs
 
 
-def spawn(name, code, out):
+def oc_messages():
+    now = time.time() * 1000
+    rows, n = [], [0]
+
+    def msg(kind, sec_ago, data):
+        n[0] += 1
+        t = now - sec_ago * 1000
+        data.setdefault("time", {"created": t, "completed": t + 500})
+        rows.append((f"msg_demo{n[0]:03d}", OC_SESSION, kind, n[0], t, t + 500, json.dumps(data)))
+
+    def tool(sec_ago, name, inp, out, meta=None):
+        t = now - sec_ago * 1000
+        return {"type": "tool", "id": f"call_{len(rows)}_{name}", "name": name, "time": {"created": t, "completed": t + 800},
+                "state": {"status": "completed", "input": inp, "content": [{"type": "text", "text": out}],
+                          "metadata": meta or {"status": "completed", "exit": 0}}}
+
+    def think(sec_ago, text):
+        t = now - sec_ago * 1000
+        return {"type": "reasoning", "text": text, "time": {"created": t, "completed": t + 400}}
+
+    msg("user", 95, {"text": "<openbot-developer-instructions>(OpenBot's instructions)</openbot-developer-instructions>\n"
+                             "Add caching to the weather lookup and check that it actually helps."})
+    msg("assistant", 92, {"agent": "build", "model": {"id": "local/coder-14b", "providerID": "lan"}, "content": [
+        think(92, "The lookup calls the API on every request. A small TTL cache keyed by city should do it. "
+                  "First check the current tests so I know what the function must keep doing."),
+        tool(90, "shell", {"command": "pytest -q tests/test_weather.py", "description": "Run the weather tests"},
+             "......\n6 passed in 0.41s"),
+        tool(86, "read", {"path": "/home/demo/weather/src/lookup.py"},
+             "def lookup(city):\n    return api.get(f'/current?q={city}').json()"),
+        think(80, "Wrap lookup in a dict cache with a 10 minute expiry. Keep the signature the same."),
+        tool(78, "edit", {"path": "/home/demo/weather/src/lookup.py", "oldString": "def lookup(city):",
+                          "newString": "@ttl_cache(seconds=600)\ndef lookup(city):"},
+             "Edited src/lookup.py (1 replacement)"),
+        tool(74, "shell", {"command": "pytest -q tests/test_weather.py"}, "......\n6 passed in 0.39s"),
+        think(70, "Tests still pass. The benchmark takes over a minute, so run it in the background and read its log."),
+        tool(68, "shell", {"command": "python3 -u bench.py", "description": "Benchmark the cache", "background": True},
+             f"Command moved to the background (shell ID: {OC_SHELL}).",
+             {"status": "running", "shellID": OC_SHELL}),
+        {"type": "text", "text": "The cache is in and the tests pass. The benchmark is running in the background; "
+                                 "I'll report the hit rate when it finishes."},
+    ]})
+    return rows
+
+
+def oc_setup():
+    os.makedirs(f"{OC_DIR}/shell/{OC_PROJECT}", exist_ok=True)
+    db = sqlite3.connect(f"{OC_DIR}/opencode.db")
+    db.execute("create table project (id text, worktree text)")
+    db.execute("create table session_v2 (id text, project_id text, parent_id text, directory text, time_updated integer)")
+    db.execute("create table session_message (id text, session_id text, type text, seq integer, "
+               "time_created integer, time_updated integer, data text)")
+    db.execute("insert into project values (?, ?)", (OC_PROJECT, OC_WS))
+    db.execute("insert into session_v2 values (?, ?, null, ?, ?)", (OC_SESSION, OC_PROJECT, OC_WS, int(time.time() * 1000)))
+    db.executemany("insert into session_message values (?, ?, ?, ?, ?, ?, ?)", oc_messages())
+    db.commit()
+    with open(f"{ROOT}/app/bench.py", "w") as f:
+        f.write(BENCH)
+    # opencode reads the command's output through a pipe and writes it to the sh_*.out file itself
+    out = open(f"{OC_DIR}/shell/{OC_PROJECT}/{OC_SHELL}.out", "w")
+    relay = subprocess.Popen(["opencode", "-c", RELAY], executable=sys.executable, stdin=subprocess.PIPE, stdout=out,
+                             start_new_session=True)
+    sh = subprocess.Popen(["bash", "-c", "python3 -u bench.py"], stdout=relay.stdin, stderr=subprocess.STDOUT,
+                          env=dict(os.environ, OPENCODE_SESSION_ID=OC_SESSION, OPENCODE="1"),
+                          start_new_session=True, cwd=f"{ROOT}/app")
+    with open(PIDS, "a") as pf:
+        pf.write(f"{relay.pid}\n{sh.pid}\n")
+
+
+def spawn(argv, code, out):
+    """Run `code` with Python under the process name argv[0], so it looks like that program in obwatch."""
     env = dict(os.environ, CLAUDE_CODE_SESSION_ID=SESSION, PYTHONUNBUFFERED="1")
     f = open(out, "w")
-    p = subprocess.Popen([name, "-c", code], executable=sys.executable, stdout=f, stderr=subprocess.STDOUT,
-                         env=env, start_new_session=True, cwd=f"{ROOT}/app")
+    src = f"{ROOT}/app/.{argv[0]}.py"
+    with open(src, "w") as sf:
+        sf.write(code)
+    # Python reads the program from stdin ("-"), so the command line shows only argv
+    p = subprocess.Popen(argv[:1] + ["-"] + argv[1:] if argv[1:] else argv, executable=sys.executable,
+                         stdin=open(src), stdout=f, stderr=subprocess.STDOUT, env=env, start_new_session=True,
+                         cwd=f"{ROOT}/app")
     with open(PIDS, "a") as pf:
         pf.write(f"{p.pid}\n")
 
 
 def start():
     stop(quiet=True)
-    for d in (f"{HOME}/.config/OpenBot", f"{HOME}/.claude/projects/{PROJ}", TASKS, LOGS):
+    for d in (f"{HOME}/.config/OpenBot", f"{HOME}/.claude/projects/{PROJ}", TASKS, LOGS, f"{ROOT}/app"):
         os.makedirs(d, exist_ok=True)
     db = sqlite3.connect(f"{HOME}/.config/OpenBot/openbot.db")
     db.execute("create table projection_agents (agent_id text, agent_json text, sort_order integer)")
@@ -157,9 +249,10 @@ def start():
         f.write("........................................................... [ 61%]\n"
                 "....................................                        [100%]\n"
                 "97 passed in 4.81s\n")
-    spawn("api-server", API_SERVER, f"{LOGS}/api.log")
-    spawn("docker", DOCKER, f"{TASKS}/bdocker01.output")
-    spawn("pytest", PYTEST, f"{TASKS}/bfgtest01.output")
+    spawn(["api-server"], API_SERVER, f"{LOGS}/api.log")
+    spawn(["docker", "build", "-t", "shop-api:dev", "."], DOCKER, f"{TASKS}/bdocker01.output")
+    spawn(["pytest", "tests/integration", "-v"], PYTEST, f"{TASKS}/bfgtest01.output")
+    oc_setup()
     print(f"Demo running. Try:\n  HOME={HOME} {os.path.dirname(os.path.dirname(os.path.abspath(__file__)))}/obwatch coder\n"
           f"Stop it with: python3 {os.path.abspath(__file__)} stop")
 

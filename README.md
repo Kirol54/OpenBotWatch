@@ -1,12 +1,12 @@
 # obwatch
 
-**See what your OpenBot agents are actually doing.** A terminal viewer for OpenBot agents that run on Claude Code. It shows the agent's messages, every command with its stated purpose, the output, and live tabs for everything the agent left running.
+**See what your OpenBot agents are actually doing.** A terminal viewer for OpenBot agents that run on **Claude Code** or **opencode**, including opencode agents on a local model (LM Studio, Ollama and similar). It shows the agent's messages, its reasoning where the harness records it, every command with its stated purpose, the output, a live process tree, and tabs for everything the agent left running.
 
-> **⚠️ This is a personal tool I made for my own testing.** It's experimental and built on OpenBot and Claude Code internals that can change at any time. Don't expect it to work properly on your setup. Feel free to try it, open an issue, or fork it.
+> **⚠️ This is a personal tool I made for my own testing.** It's experimental and built on OpenBot, Claude Code and opencode internals that can change at any time. Don't expect it to work properly on your setup. Feel free to try it, open an issue, or fork it.
 
 ## Why
 
-When I use OpenBot agents for coding, the chat only shows me the agent's summary. I wanted to see what Claude Code is actually running: the commands and their output. I also wanted to attach to the logs of whatever it starts in its terminal, like a build, a server or a test run, while it's still going. obwatch is the quick tool I wrote for that.
+When I use OpenBot agents for coding, the chat only shows me the agent's summary. I wanted to see what the agent is actually running: the commands and their output. I also wanted to attach to the logs of whatever it starts in its terminal, like a build, a server or a test run, while it's still going. obwatch is the quick tool I wrote for that.
 
 ![Activity tab](docs/activity.png)
 
@@ -14,21 +14,27 @@ When I use OpenBot agents for coding, the chat only shows me the agent's summary
 
 - **Activity tab:** a live feed of the agent's session:
   - `IN`: messages the agent receives (from you, teammates, or task notifications)
+  - `THINK`: the model's reasoning (opencode agents; see [Limitations](#limitations) for Claude)
   - `SAY`: what the agent writes
   - `#`: why it runs a command (the description it gives the command)
   - `$`: the command itself
   - `│` / `ERR`: the command's output, or its error
   - `TOOL`: file reads, edits, searches, and other tools
+- **Processes tab:** every process the agent started, as a tree with CPU, memory and run time (with the total in cores, e.g. "CPU 2900% (≈29 cores)"), plus **where each one's output goes**: a file (with a tab), the terminal, a pipe or socket read by another program, or `/dev/null`. Programs launched through `systemd-run` are included too, although they run outside the agent's process tree.
 - **One tab per running process**, found automatically:
   - foreground commands while they run,
   - background jobs,
   - processes the agent detached with `nohup`/`setsid`, such as servers and long builds. These are followed through the log files they write to.
 - **Running first, finished after.** `●` running, `✓` finished, `+N` new lines since you last looked. Error lines are red and warnings are yellow.
-- **Agent list:** pick any agent and see whether it's working, idle, and how many processes it has running.
+- **Agent list:** pick any agent and see whether it's working, idle, and how many processes it has running. Agents appear in the same order as in OpenBot's sidebar.
 - **Read-only:** it never touches your agents and opens OpenBot's database read-only.
 - **One file, no dependencies:** only Python's standard library.
 
+![Processes tab](docs/processes.png)
+
 ![Log tab of a server the agent started](docs/log-tab.png)
+
+![An opencode agent on a local model, with its reasoning](docs/opencode.png)
 
 ![Agent list](docs/agents.png)
 
@@ -36,7 +42,7 @@ When I use OpenBot agents for coding, the chat only shows me the agent's summary
 
 - Linux, on the machine where OpenBot runs. obwatch reads `/proc`. It works fine over SSH.
 - Python 3.8 or newer.
-- Agents that use the **Claude** provider. Agents on other providers (such as opencode) appear in the list, but there's nothing to watch for them yet.
+- Agents on the **Claude** or **opencode** provider. Agents on other providers appear in the list as "not supported".
 
 ## Install
 
@@ -76,11 +82,12 @@ obwatch --version
 | `x` | close this tab (a running process keeps running) |
 | `X` | close all finished tabs |
 | `a` / `Esc` | back to the agent list |
+| | The Processes tab starts at the top; scrolling pauses it and `G` makes it live again. |
 | `q` | quit |
 
 ### Tabs
 
-- The tab bar is ordered: **Activity**, pinned files (`≡`), **running** tabs (oldest first), then a yellow `┃` and the **finished** tabs (most recent first).
+- The tab bar is ordered: **Activity**, **Processes** (`⚙`), pinned files (`≡`), **running** tabs (oldest first), then a yellow `┃` and the **finished** tabs (most recent first).
 - Tab numbers follow this order, so a number can change when something finishes.
 - When there are more tabs than fit, `«3` and `5»` show how many are hidden on each side.
 - Tabs are named after the agent's description of the command (e.g. "Build the Docker image"), or after the program (e.g. `api-server`, `docker build`), or after the log file.
@@ -89,22 +96,28 @@ obwatch --version
 
 ## How it works
 
-| What | Where it comes from |
-|---|---|
-| Agent names and workspaces | `~/.config/OpenBot/openbot.db`, opened read-only |
-| Activity feed | Claude Code session files: `~/.claude/projects/<workspace>/*.jsonl` (or `$CLAUDE_CONFIG_DIR/projects`), including subagents |
-| Process tabs | Every process an agent's command starts inherits `CLAUDE_CODE_SESSION_ID`, even when detached with `setsid`/`nohup`. obwatch finds these processes in `/proc` and follows the files they write to: their stdout/stderr, plus open files ending in `.log`, `.out`, `.output` or `.txt` |
-| Background and foreground commands | Claude Code writes their output to `/tmp/claude-<uid>/<workspace>/<session>/tasks/*.output` |
+OpenBot doesn't run the agent loop itself. It hands each agent to a **harness**: Claude Code for the Claude provider, opencode for the opencode provider. The harness sends prompts to the model, runs the tools (shell, file edits) and keeps the history. For a local LLM, LM Studio only serves the model; opencode is still the harness. obwatch reads what each harness leaves on disk:
 
-MCP servers that Claude Code starts are filtered out, so only the agent's own commands show up.
+| What | Claude Code | opencode |
+|---|---|---|
+| Agent names and workspaces | `~/.config/OpenBot/openbot.db`, opened read-only; order from `openbot-sidebar-layout-v1.json` | same |
+| Activity feed | `~/.claude/projects/<workspace>/*.jsonl` (or `$CLAUDE_CONFIG_DIR/projects`), including subagents | `~/.local/share/opencode/opencode.db` (or `$XDG_DATA_HOME/opencode`), opened read-only: sessions whose directory is the agent's workspace, plus the ones OpenBot recorded for it, plus their subagents |
+| Which processes belong to the agent | they inherit `CLAUDE_CODE_SESSION_ID` | they inherit `OPENCODE_SESSION_ID` |
+| Command output files | `/tmp/claude-<uid>/<workspace>/<session>/tasks/*.output` | `~/.local/share/opencode/shell/<project>/sh_*.out` |
+
+Both session variables survive `setsid`/`nohup`, so detached servers and builds are found too. Children of those processes count as well, even when a tool started them with a cleaned environment. An opencode command that drops the environment itself (`env -i …`) is matched by start time against the agent's `sh_*.out` files. obwatch looks them up in `/proc` and follows the files they write to: their stdout/stderr, plus open files ending in `.log`, `.out`, `.output` or `.txt`. Programs started with `systemd-run` lose the variable; obwatch finds them by their systemd unit name (`--unit=`), or by the output pipe they share with `systemd-run --pipe`.
+
+MCP servers that the harness starts are filtered out, so only the agent's own commands show up.
 
 ## Limitations
 
-- **No reasoning text.** OpenBot starts Claude Code without `--thinking-display summarized`, so the reasoning in the session files is empty. The `#` line, the reason the agent gives for each command, usually covers it. If OpenBot ever enables summaries, they appear automatically as `THINK` lines.
+- **No reasoning for Claude agents.** OpenBot starts Claude Code without `--thinking-display summarized`, so the reasoning in the session files is empty. The `#` line, the reason the agent gives for each command, usually covers it. If OpenBot ever enables summaries, they appear automatically as `THINK` lines. opencode stores the model's reasoning as plain text, so opencode agents show it.
+- **Output sent to a pipe or socket can't be shown live.** If a tool runs a program and reads its output itself (e.g. a test runner, or `systemd-run --pipe`), only that tool sees it. The Processes tab shows where it goes. To get a live tab, have the command write to a file, e.g. `... 2>&1 | tee run.log`.
+- **Python output to a file arrives in chunks.** Python buffers stdout when it isn't a terminal, so a log can stay empty for a while. Run it with `python -u` or `PYTHONUNBUFFERED=1`; the Processes tab points this out.
 - **Linux only**, because it relies on `/proc`.
 - A program that writes to its own log file (not stdout) only becomes a tab if the file ends in `.log`, `.out`, `.output` or `.txt`. Pin anything else with `-f`.
 - Processes inside Docker containers aren't visible. The `docker build` / `docker run` command's own output is.
-- The file formats come from OpenBot and Claude Code internals and may change between versions. Tested with OpenBot 0.54.0 and Claude Code 2.1.312.
+- The file formats come from OpenBot, Claude Code and opencode internals and may change between versions. Tested with OpenBot 0.54.0, Claude Code 2.1.312–2.1.316 and opencode 2.2.5.
 
 ## Privacy
 
@@ -112,7 +125,15 @@ Session files can contain anything the agent has seen, including secrets that ap
 
 ## Development
 
-`dev/demo.py` creates a fake OpenBot setup: three demo agents, a session, and a few running processes. Use it to try obwatch or work on it without real agents:
+Tests use only the standard library:
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+GitHub Actions runs them on Python 3.8 to 3.13 (`.github/workflows/test.yml`).
+
+`dev/demo.py` creates a fake OpenBot setup: a Claude Code agent and an opencode agent with sessions and running processes, an idle agent, and one on an unsupported provider. Use it to try obwatch or work on it without real agents:
 
 ```bash
 python3 dev/demo.py start
